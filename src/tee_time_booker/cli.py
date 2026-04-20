@@ -53,8 +53,10 @@ def schedule(plan_path: Path, confirm: bool, lead_minutes: int) -> None:
     flag = "--confirm" if confirm else "--dry-run"
     label = f"com.aminard.tee-time-booker.{plan.target_date.isoformat()}"
     plist_path = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
-    log_path = Path("/tmp") / f"{label}.log"
-    err_path = Path("/tmp") / f"{label}.err.log"
+    logs_dir = project_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / f"{label}.log"
+    err_path = logs_dir / f"{label}.err.log"
 
     plist = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -122,18 +124,23 @@ def run(plan_path: Path, dry_run: bool, confirm: bool) -> None:
     """Execute a booking run against a plan.
 
     Waits until the plan's release moment (NTP-synced) before firing. If the
-    release moment has already passed, fires immediately.
+    release moment has already passed, fires immediately. Writes a JSON result
+    summary to logs/ regardless of outcome, for post-hoc observability.
     """
     if not dry_run and not confirm:
         raise click.UsageError("Real runs require --confirm. Use --dry-run otherwise.")
 
     import asyncio
+    import json
+    import traceback
+    from datetime import datetime
 
     import structlog
     from dotenv import load_dotenv
 
     from tee_time_booker.book import run_scheduled_booking
     from tee_time_booker.config import Secrets, load_plan
+    from tee_time_booker.constants import CENTRAL
 
     structlog.configure(
         processors=[
@@ -146,20 +153,69 @@ def run(plan_path: Path, dry_run: bool, confirm: bool) -> None:
     secrets = Secrets()  # type: ignore[call-arg]
     plan = load_plan(plan_path)
 
-    result = asyncio.run(
-        run_scheduled_booking(plan, secrets, dry_run=not confirm)
-    )
+    logs_dir = Path("logs")
+    logs_dir.mkdir(exist_ok=True)
+    run_id = datetime.now(tz=CENTRAL).strftime("%Y-%m-%dT%H%M%S")
+    result_path = logs_dir / f"{run_id}-result.json"
+
+    started_at = datetime.now(tz=CENTRAL)
+    result = None
+    error = None
+    error_traceback = None
+    try:
+        result = asyncio.run(run_scheduled_booking(plan, secrets, dry_run=not confirm))
+    except Exception as e:
+        error = e
+        error_traceback = traceback.format_exc()
+    finished_at = datetime.now(tz=CENTRAL)
+
+    summary = {
+        "run_id": run_id,
+        "started_at": started_at.isoformat(timespec="seconds"),
+        "finished_at": finished_at.isoformat(timespec="seconds"),
+        "duration_seconds": round((finished_at - started_at).total_seconds(), 2),
+        "target_date": plan.target_date.isoformat(),
+        "plan_path": str(plan_path),
+        "mode": "real" if confirm else "dry_run",
+        "success": error is None,
+        "steps_completed": result.steps_completed if result else [],
+        "slot": (
+            {
+                "course": result.slot.course,
+                "tee_time": result.slot.tee_time.isoformat(),
+                "grfmid": result.slot.grfmid,
+            }
+            if result and result.slot
+            else None
+        ),
+        "confirmation_url": result.confirmation_url if result else None,
+        "error": str(error) if error else None,
+        "error_type": type(error).__name__ if error else None,
+        "error_traceback": error_traceback,
+    }
+    result_path.write_text(json.dumps(summary, indent=2, default=str))
 
     click.echo()
-    click.echo("=== DONE ===" if not result.dry_run else "=== DRY RUN DONE ===")
-    click.echo(f"Steps: {' → '.join(result.steps_completed)}")
-    if result.slot:
-        click.echo(
-            f"Slot:  {result.slot.course} @ "
-            f"{result.slot.tee_time.strftime('%a %m/%d %I:%M %p')}"
-        )
-    if result.confirmation_url:
-        click.echo(f"Confirmation URL: {result.confirmation_url}")
+    if error is None:
+        click.echo("=== DONE ===" if confirm else "=== DRY RUN DONE ===")
+        click.echo(f"Steps: {' → '.join(result.steps_completed)}")
+        if result.slot:
+            click.echo(
+                f"Slot:  {result.slot.course} @ "
+                f"{result.slot.tee_time.strftime('%a %m/%d %I:%M %p')}"
+            )
+        if result.confirmation_url:
+            click.echo(f"Confirmation URL: {result.confirmation_url}")
+    else:
+        click.secho(f"=== FAILED: {type(error).__name__}: {error} ===", fg="red")
+        if result and result.steps_completed:
+            click.echo(f"Steps completed before failure: {' → '.join(result.steps_completed)}")
+
+    click.echo()
+    click.echo(f"Result summary: {result_path.resolve()}")
+
+    if error is not None:
+        raise error
 
 
 @cli.command()

@@ -14,6 +14,7 @@ wheels/
 plans/*
 !plans/example.yaml
 runs/
+logs/
 *.log
 
 # Local-only (not committed)
