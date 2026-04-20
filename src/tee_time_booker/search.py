@@ -8,13 +8,16 @@ for the add-to-cart request.
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import structlog
 from bs4 import BeautifulSoup, Tag
-from curl_cffi.requests import AsyncSession
 
 from tee_time_booker.constants import MODULE, RESERVATION_TYPE
+
+if TYPE_CHECKING:
+    from tee_time_booker.session import BookingSession
 
 log = structlog.get_logger()
 
@@ -56,9 +59,7 @@ def build_search_url(
 
 
 async def search(
-    client: AsyncSession,
-    base_url: str,
-    csrf_token: str,
+    session: "BookingSession",
     *,
     target_date: date,
     earliest_time: time,
@@ -73,16 +74,17 @@ async def search(
     The returned csrf_token is scraped from the response (may have rotated).
     """
     url = build_search_url(
-        base_url,
-        csrf_token,
+        session.base_url,
+        session.csrf_token,
         target_date=target_date,
         earliest_time=earliest_time,
         num_players=num_players,
         num_holes=num_holes,
     )
     log.info("fetching search results", url=url)
-    resp = await client.get(url)
-    resp.raise_for_status()
+    resp = await session.get(url)
+    if not resp.ok:
+        raise RuntimeError(f"search: HTTP {resp.status}")
 
     html = resp.text
     if debug_dump:
@@ -91,13 +93,13 @@ async def search(
 
     all_slots = _parse_results(html, target_date=target_date, num_holes=num_holes)
     in_window = [s for s in all_slots if s.tee_time.time() <= latest_time]
-    fresh_csrf = _scrape_csrf(html) or csrf_token
+    fresh_csrf = _scrape_csrf(html) or session.csrf_token
 
     log.info(
         "search parsed",
         total_found=len(all_slots),
         in_time_window=len(in_window),
-        fresh_csrf_differs=(fresh_csrf != csrf_token),
+        fresh_csrf_differs=(fresh_csrf != session.csrf_token),
     )
     return in_window, fresh_csrf
 
@@ -226,17 +228,13 @@ async def _smoke_test() -> None:
         holes=plan.holes,
     )
 
-    sess = await login(
+    async with await login(
         secrets.username,
         secrets.password.get_secret_value(),
         secrets.base_url,
-    )
-
-    async with sess.client() as client:
+    ) as sess:
         slots, fresh_csrf = await search(
-            client,
-            sess.base_url,
-            sess.csrf_token,
+            sess,
             target_date=plan.target_date,
             earliest_time=plan.earliest_time,
             latest_time=plan.latest_time,
