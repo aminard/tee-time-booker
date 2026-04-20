@@ -98,15 +98,86 @@ def _course_slug(display_name: str) -> str:
     return display_name.lower().replace(" ", "_")
 
 
+def rank_slots(
+    slots: list[TeeTimeSlot], course_order: list[str]
+) -> list[TeeTimeSlot]:
+    """Rank eligible slots. Most-preferred course first; within a course, earliest tee time first.
+
+    Slots whose course isn't in `course_order` are excluded.
+    """
+    ranked = {slug: i for i, slug in enumerate(course_order)}
+    eligible = [s for s in slots if _course_slug(s.course) in ranked]
+    return sorted(eligible, key=lambda s: (ranked[_course_slug(s.course)], s.tee_time))
+
+
 def pick_best_slot(
     slots: list[TeeTimeSlot], course_order: list[str]
 ) -> TeeTimeSlot | None:
-    """Most-preferred course wins; within a course, the earliest tee time wins."""
-    ranked = {slug: i for i, slug in enumerate(course_order)}
-    eligible = [s for s in slots if _course_slug(s.course) in ranked]
-    if not eligible:
-        return None
-    return min(eligible, key=lambda s: (ranked[_course_slug(s.course)], s.tee_time))
+    """Convenience: top-ranked slot, or None if none match."""
+    ranked = rank_slots(slots, course_order)
+    return ranked[0] if ranked else None
+
+
+def _claim_succeeded(claim_html: str) -> bool:
+    """True if the claim response shows the player-selection form — i.e., the
+    slot was actually added to the cart. If the server rejected the claim
+    (slot gone, session error, etc.), the form is absent."""
+    return 'name="golfmemberselection_player1"' in claim_html
+
+
+async def _claim_first_available(
+    session: BookingSession,
+    csrf_token: str,
+    ranked_slots: list[TeeTimeSlot],
+    num_players: int,
+    *,
+    max_attempts: int,
+) -> tuple[TeeTimeSlot, str]:
+    """Iterate preference-ranked slots, firing claim GETs until one succeeds.
+
+    Returns (slot, claim_response_html) for the first slot whose claim lands a
+    player-selection form. Falls through rejections fast — a "claim didn't
+    add to cart" outcome is non-state-changing on the server, so it's safe to
+    immediately attempt the next slot.
+
+    Raises RuntimeError if all `max_attempts` candidates are rejected.
+    """
+    last_error: Exception | None = None
+    for rank, slot in enumerate(ranked_slots[:max_attempts]):
+        log.info(
+            "attempting claim",
+            rank=rank,
+            course=slot.course,
+            tee_time=slot.tee_time.isoformat(),
+            grfmid=slot.grfmid,
+        )
+        try:
+            claim_html = await with_retry(
+                lambda s=slot: claim_slot(session, csrf_token, s, num_players),
+                label=f"claim_slot[rank={rank}]",
+                attempts=2,
+                initial_delay_ms=50,
+                max_delay_ms=100,
+            )
+        except Exception as e:
+            log.warning("claim errored, trying next", rank=rank, error=str(e))
+            last_error = e
+            continue
+
+        if _claim_succeeded(claim_html):
+            log.info("claim accepted", rank=rank, course=slot.course)
+            return slot, claim_html
+
+        log.warning(
+            "claim rejected (no player form in response), trying next",
+            rank=rank,
+            course=slot.course,
+        )
+
+    raise RuntimeError(
+        f"all {max_attempts} ranked slots failed to claim"
+        + (f"; last error: {last_error}" if last_error else "")
+    )
 
 
 def build_claim_url(
@@ -300,27 +371,23 @@ async def run_booking(session: BookingSession, plan, secrets, *, dry_run: bool =
     if not slots:
         raise RuntimeError("run_booking: no slots in window")
 
-    chosen = pick_best_slot(slots, plan.courses_ranked())
-    if chosen is None:
+    ranked = rank_slots(slots, plan.courses_ranked())
+    if not ranked:
         raise RuntimeError("run_booking: no slots match preferred courses")
-    result.slot = chosen
-    result.steps_completed.append("pick")
     log.info(
-        "run_booking: picked",
-        course=chosen.course,
-        tee_time=chosen.tee_time.isoformat(),
-        grfmid=chosen.grfmid,
+        "run_booking: ranked candidates",
+        count=len(ranked),
+        top=[(s.course, s.tee_time.strftime("%I:%M %p")) for s in ranked[:5]],
     )
 
-    # Race-critical: fewer, faster retries so we don't lose the slot to a
-    # competing bot while waiting.
-    claim_html = await with_retry(
-        lambda: claim_slot(session, csrf, chosen, plan.num_players),
-        label="claim_slot",
-        attempts=2,
-        initial_delay_ms=50,
-        max_delay_ms=100,
+    # Try slots in preference order. First one whose claim lands a player-
+    # selection form wins. If top pick is grabbed by a competing bot, fall
+    # through to the next — the search already filtered by time window, so
+    # every option here is acceptable.
+    chosen, claim_html = await _claim_first_available(
+        session, csrf, ranked, plan.num_players, max_attempts=min(5, len(ranked))
     )
+    result.slot = chosen
     result.steps_completed.append("claim")
     csrf = _scrape_csrf(claim_html) or csrf
 
