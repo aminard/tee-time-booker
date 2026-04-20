@@ -17,9 +17,11 @@ in-page fetch) so every request shares the TLS/session fingerprint of the
 browser that logged in.
 """
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import time as dtime, timedelta
 from pathlib import Path
+from typing import Awaitable, Callable, TypeVar
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import structlog
@@ -30,6 +32,45 @@ from tee_time_booker.search import TeeTimeSlot, _scrape_csrf, search
 from tee_time_booker.session import BookingSession
 
 log = structlog.get_logger()
+
+T = TypeVar("T")
+
+
+async def with_retry(
+    func: Callable[[], Awaitable[T]],
+    *,
+    label: str,
+    attempts: int = 3,
+    initial_delay_ms: int = 300,
+    max_delay_ms: int = 1500,
+) -> T:
+    """Retry an async call with exponential backoff.
+
+    Every exception is retried up to `attempts` times — WebTrac's errors
+    mostly come back as HTTP status mismatches wrapped in RuntimeError, not
+    fine-grained types, so we don't try to filter by exception class. The
+    caller controls retry policy by not wrapping genuinely non-retriable
+    operations (notably `finalize_booking`).
+    """
+    delay_ms = initial_delay_ms
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await func()
+        except Exception as e:
+            last_error = e
+            if attempt < attempts:
+                log.warning(
+                    "retry",
+                    label=label,
+                    attempt=attempt,
+                    error=str(e),
+                    next_delay_ms=delay_ms,
+                )
+                await asyncio.sleep(delay_ms / 1000)
+                delay_ms = min(delay_ms * 2, max_delay_ms)
+    assert last_error is not None
+    raise last_error
 
 
 @dataclass(frozen=True)
@@ -236,16 +277,24 @@ async def finalize_booking(
 
 
 async def run_booking(session: BookingSession, plan, secrets, *, dry_run: bool = True) -> BookingResult:
-    """Full pipeline. Stops before the binding POST when `dry_run=True`."""
+    """Full pipeline. Stops before the binding POST when `dry_run=True`.
+
+    Non-binding steps retry with exponential backoff on transient failures.
+    The finalize POST is never retried — the server may have committed even
+    on a "failed" response, and a retry would risk a double-booking.
+    """
     result = BookingResult(dry_run=dry_run)
 
-    slots, csrf = await search(
-        session,
-        target_date=plan.target_date,
-        earliest_time=plan.earliest_time,
-        latest_time=plan.latest_time,
-        num_players=plan.num_players,
-        num_holes=plan.holes,
+    slots, csrf = await with_retry(
+        lambda: search(
+            session,
+            target_date=plan.target_date,
+            earliest_time=plan.earliest_time,
+            latest_time=plan.latest_time,
+            num_players=plan.num_players,
+            num_holes=plan.holes,
+        ),
+        label="search",
     )
     result.steps_completed.append("search")
     if not slots:
@@ -263,17 +312,34 @@ async def run_booking(session: BookingSession, plan, secrets, *, dry_run: bool =
         grfmid=chosen.grfmid,
     )
 
-    claim_html = await claim_slot(session, csrf, chosen, plan.num_players)
+    # Race-critical: fewer, faster retries so we don't lose the slot to a
+    # competing bot while waiting.
+    claim_html = await with_retry(
+        lambda: claim_slot(session, csrf, chosen, plan.num_players),
+        label="claim_slot",
+        attempts=2,
+        initial_delay_ms=50,
+        max_delay_ms=100,
+    )
     result.steps_completed.append("claim")
     csrf = _scrape_csrf(claim_html) or csrf
 
-    csrf = await submit_players(session, csrf, secrets.member_id, plan.num_players)
+    csrf = await with_retry(
+        lambda: submit_players(session, csrf, secrets.member_id, plan.num_players),
+        label="submit_players",
+    )
     result.steps_completed.append("players")
 
-    csrf = await advance_to_cart(session, csrf)
+    csrf = await with_retry(
+        lambda: advance_to_cart(session, csrf),
+        label="advance_to_cart",
+    )
     result.steps_completed.append("cart")
 
-    result.checkout_form = await load_checkout_form(session, csrf)
+    result.checkout_form = await with_retry(
+        lambda: load_checkout_form(session, csrf),
+        label="load_checkout_form",
+    )
     result.steps_completed.append("checkout")
 
     if dry_run:
@@ -308,7 +374,7 @@ async def run_scheduled_booking(
     secrets,
     *,
     dry_run: bool = True,
-    lead_time_sec: int = 15,
+    lead_time_sec: int = 30,
     headless: bool = False,
 ) -> BookingResult:
     """Run a booking, waiting until the plan's release moment before firing.
@@ -456,15 +522,24 @@ async def run_cancellation(
     result = BookingResult(dry_run=dry_run)
     csrf = session.csrf_token
 
-    search_html = await cancel_search(session, csrf, confirmation_numbers, tee_time)
+    search_html = await with_retry(
+        lambda: cancel_search(session, csrf, confirmation_numbers, tee_time),
+        label="cancel_search",
+    )
     result.steps_completed.append("cancel_search")
     csrf = _scrape_csrf(search_html) or csrf
 
-    cart_html = await add_cancellation_to_cart(session, csrf, confirmation_numbers)
+    cart_html = await with_retry(
+        lambda: add_cancellation_to_cart(session, csrf, confirmation_numbers),
+        label="add_cancellation_to_cart",
+    )
     result.steps_completed.append("cancel_claim")
     csrf = _scrape_csrf(cart_html) or csrf
 
-    result.checkout_form = await load_checkout_form(session, csrf)
+    result.checkout_form = await with_retry(
+        lambda: load_checkout_form(session, csrf),
+        label="load_checkout_form",
+    )
     result.steps_completed.append("checkout")
 
     if dry_run:
