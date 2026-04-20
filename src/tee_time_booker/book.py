@@ -290,12 +290,19 @@ async def _smoke_test() -> None:
     if not dry_run:
         print("!! BOOK_FOR_REAL=1 set — this will COMMIT a real reservation. !!")
 
+    keep_open = os.getenv("KEEP_BROWSER_OPEN", "0") == "1"
+
     async with await login(
         secrets.username,
         secrets.password.get_secret_value(),
         secrets.base_url,
     ) as session:
         result = await run_booking(session, plan, secrets, dry_run=dry_run)
+
+        if keep_open:
+            import asyncio
+            print("\n(Browser kept open — inspect the page, then press Enter here to close.)")
+            await asyncio.to_thread(input)
 
     header = "=== DRY RUN COMPLETE ===" if dry_run else "=== BOOKING COMMITTED ==="
     print(f"\n{header}")
