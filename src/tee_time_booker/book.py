@@ -18,6 +18,7 @@ browser that logged in.
 """
 
 import asyncio
+import random
 from dataclasses import dataclass, field
 from datetime import time as dtime, timedelta
 from pathlib import Path
@@ -443,6 +444,7 @@ async def run_scheduled_booking(
     dry_run: bool = True,
     lead_time_sec: int = 30,
     headless: bool = False,
+    post_release_jitter_ms: tuple[int, int] = (50, 300),
 ) -> BookingResult:
     """Run a booking, waiting until the plan's release moment before firing.
 
@@ -451,9 +453,15 @@ async def run_scheduled_booking(
       2. Sleep until T - lead_time_sec
       3. Log in (takes ~3-5 s)
       4. Sleep until T = 0 (release moment)
-      5. Fire the booking pipeline (search → claim → …)
+      5. Sleep a small random jitter (default 50-300 ms) after release
+      6. Fire the booking pipeline (search → claim → …)
 
-    If the release moment has already passed, fires immediately.
+    The post-release jitter serves two purposes: it makes the timing look
+    less mechanically uniform, and it gives the server's caches a moment to
+    finish propagating the newly-released slots before we search for them.
+
+    If the release moment has already passed, fires immediately without
+    waiting or jittering.
     """
     from tee_time_booker.clock import compute_release_moment, sync_clock
     from tee_time_booker.session import login
@@ -500,7 +508,10 @@ async def run_scheduled_booking(
         log.info("logged in, waiting for release moment", wait_seconds=wait_s)
         await clock.sleep_until(release)
 
-        log.info("firing booking pipeline at release moment")
+        jitter_ms = random.randint(*post_release_jitter_ms)
+        log.info("release hit; jittering before firing", jitter_ms=jitter_ms)
+        await asyncio.sleep(jitter_ms / 1000)
+
         return await run_booking(session, plan, secrets, dry_run=dry_run)
 
 
