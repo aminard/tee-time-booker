@@ -16,9 +16,102 @@ def plan() -> None:
 
 @cli.command()
 @click.argument("plan_path", type=click.Path(exists=True, path_type=Path))
-def schedule(plan_path: Path) -> None:
-    """Compute release moment for a plan and schedule its execution."""
-    raise NotImplementedError("schedule: not implemented yet")
+@click.option("--confirm", is_flag=True, help="The scheduled run will commit the booking (default: dry-run).")
+@click.option("--lead-minutes", type=int, default=3, show_default=True,
+              help="Minutes before release to launch the process (buffers launchd jitter + login time).")
+def schedule(plan_path: Path, confirm: bool, lead_minutes: int) -> None:
+    """Generate a launchd plist to run the bot automatically at a plan's release moment.
+
+    Writes a .plist into ~/Library/LaunchAgents/ that fires the bot a few
+    minutes before release. The bot then NTP-syncs and waits for the precise
+    instant before claiming the slot.
+
+    Your Mac must be awake and logged into your user account at fire time.
+    """
+    import shutil
+    from datetime import timedelta
+
+    from tee_time_booker.clock import compute_release_moment
+    from tee_time_booker.config import load_plan
+    from tee_time_booker.constants import CENTRAL
+
+    plan = load_plan(plan_path)
+    release_utc = compute_release_moment(plan.target_date)
+    fire_at_utc = release_utc - timedelta(minutes=lead_minutes)
+    fire_at_local = fire_at_utc.astimezone()
+
+    plan_abs = plan_path.resolve()
+    project_dir = plan_abs.parent if plan_abs.parent.name == "plans" else plan_abs.parent
+    # Walk up to the project root (containing pyproject.toml)
+    while project_dir != project_dir.parent and not (project_dir / "pyproject.toml").exists():
+        project_dir = project_dir.parent
+
+    uv_path = shutil.which("uv")
+    if not uv_path:
+        raise click.ClickException("Could not locate `uv` on PATH. Is uv installed?")
+
+    flag = "--confirm" if confirm else "--dry-run"
+    label = f"com.aminard.tee-time-booker.{plan.target_date.isoformat()}"
+    plist_path = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+    log_path = Path("/tmp") / f"{label}.log"
+    err_path = Path("/tmp") / f"{label}.err.log"
+
+    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{uv_path}</string>
+        <string>run</string>
+        <string>--project</string>
+        <string>{project_dir}</string>
+        <string>tee-time-booker</string>
+        <string>run</string>
+        <string>{flag}</string>
+        <string>{plan_abs}</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>{project_dir}</string>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Month</key><integer>{fire_at_local.month}</integer>
+        <key>Day</key><integer>{fire_at_local.day}</integer>
+        <key>Hour</key><integer>{fire_at_local.hour}</integer>
+        <key>Minute</key><integer>{fire_at_local.minute}</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>{log_path}</string>
+    <key>StandardErrorPath</key>
+    <string>{err_path}</string>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
+"""
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    plist_path.write_text(plist)
+
+    release_ct = release_utc.astimezone(CENTRAL)
+    click.echo(f"Plist written:  {plist_path}")
+    click.echo(f"Fire time:      {fire_at_local.strftime('%a %Y-%m-%d %I:%M %p %Z')} "
+               f"(lead {lead_minutes} min)")
+    click.echo(f"Release moment: {release_ct.strftime('%a %Y-%m-%d %I:%M:%S %p %Z')}")
+    click.echo(f"Mode:           {'REAL BOOKING (--confirm)' if confirm else 'dry-run'}")
+    click.echo()
+    click.echo("To activate:   launchctl load " + str(plist_path))
+    click.echo("To verify:     launchctl list | grep tee-time-booker")
+    click.echo("To deactivate: launchctl unload " + str(plist_path) + " && rm " + str(plist_path))
+    click.echo()
+    click.echo("Logs will land at:")
+    click.echo(f"  stdout: {log_path}")
+    click.echo(f"  stderr: {err_path}")
+    click.echo()
+    click.secho("!! Your Mac must be AWAKE and LOGGED IN at fire time. !!", fg="yellow")
+    click.secho("!! Remember to unload the plist after the run so it doesn't re-fire yearly. !!",
+                fg="yellow")
 
 
 @cli.command()
