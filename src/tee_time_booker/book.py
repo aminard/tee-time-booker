@@ -18,7 +18,7 @@ browser that logged in.
 """
 
 from dataclasses import dataclass, field
-from datetime import time as dtime
+from datetime import time as dtime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -296,6 +296,79 @@ async def run_booking(session: BookingSession, plan, secrets, *, dry_run: bool =
     result.steps_completed.append("finalize")
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Scheduled (release-moment-aware) entry point
+# ---------------------------------------------------------------------------
+
+
+async def run_scheduled_booking(
+    plan,
+    secrets,
+    *,
+    dry_run: bool = True,
+    lead_time_sec: int = 15,
+    headless: bool = False,
+) -> BookingResult:
+    """Run a booking, waiting until the plan's release moment before firing.
+
+    Timeline:
+      1. Sync clock against NTP (~200 ms)
+      2. Sleep until T - lead_time_sec
+      3. Log in (takes ~3-5 s)
+      4. Sleep until T = 0 (release moment)
+      5. Fire the booking pipeline (search → claim → …)
+
+    If the release moment has already passed, fires immediately.
+    """
+    from tee_time_booker.clock import compute_release_moment, sync_clock
+    from tee_time_booker.session import login
+
+    release = compute_release_moment(plan.target_date)
+    clock = await sync_clock()
+    now = clock.now_utc()
+
+    log.info(
+        "scheduled run",
+        target_date=plan.target_date.isoformat(),
+        release_utc=release.isoformat(),
+        now_utc=now.isoformat(),
+        offset_ms=clock.offset_seconds * 1000,
+    )
+
+    if now >= release:
+        log.warning(
+            "release moment has already passed, firing immediately",
+            past_by_seconds=(now - release).total_seconds(),
+        )
+        async with await login(
+            secrets.username,
+            secrets.password.get_secret_value(),
+            secrets.base_url,
+            headless=headless,
+        ) as session:
+            return await run_booking(session, plan, secrets, dry_run=dry_run)
+
+    login_at = release - timedelta(seconds=lead_time_sec)
+    now = clock.now_utc()
+    if now < login_at:
+        wait_s = (login_at - now).total_seconds()
+        log.info("waiting until login moment", wait_seconds=wait_s)
+        await clock.sleep_until(login_at)
+
+    async with await login(
+        secrets.username,
+        secrets.password.get_secret_value(),
+        secrets.base_url,
+        headless=headless,
+    ) as session:
+        wait_s = (release - clock.now_utc()).total_seconds()
+        log.info("logged in, waiting for release moment", wait_seconds=wait_s)
+        await clock.sleep_until(release)
+
+        log.info("firing booking pipeline at release moment")
+        return await run_booking(session, plan, secrets, dry_run=dry_run)
 
 
 # ---------------------------------------------------------------------------
