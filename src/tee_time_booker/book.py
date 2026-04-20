@@ -189,16 +189,32 @@ async def finalize_booking(
     *,
     bill_firstname: str,
     bill_lastname: str,
+    bill_address1: str,
+    bill_address2: str,
+    bill_city: str,
+    bill_state: str,
+    bill_zip: str,
     bill_phone: str,
     bill_email: str,
     summary_hash: str = "0_0_0_0_0_0_0_0_0_0_0_0_0",
 ) -> str:
-    """BINDING POST. Only call when the caller has explicitly opted in."""
+    """BINDING POST. Only call when the caller has explicitly opted in.
+
+    Always submits the full billing-address set. The booking flow's server
+    silently auto-fills missing fields for logged-in members, but the
+    cancellation flow does not — sending the full set always is simpler and
+    works for both.
+    """
     body = dict(checkout_form.hidden_fields)
     body["Action"] = "ProcessSale"
     body["SubAction"] = ""
     body["webcheckout_billfirstname"] = bill_firstname
     body["webcheckout_billlastname"] = bill_lastname
+    body["webcheckout_billaddress1"] = bill_address1
+    body["webcheckout_billaddress2"] = bill_address2
+    body["webcheckout_billcity"] = bill_city
+    body["webcheckout_billstate"] = bill_state
+    body["webcheckout_billzip"] = bill_zip
     body["webcheckout_billphone"] = bill_phone
     body["webcheckout_billemail"] = bill_email
     body["webcheckout_billemail_2"] = bill_email
@@ -262,6 +278,11 @@ async def run_booking(session: BookingSession, plan, secrets, *, dry_run: bool =
         result.checkout_form,
         bill_firstname=secrets.bill_firstname,
         bill_lastname=secrets.bill_lastname,
+        bill_address1=secrets.bill_address1,
+        bill_address2=secrets.bill_address2,
+        bill_city=secrets.bill_city,
+        bill_state=secrets.bill_state,
+        bill_zip=secrets.bill_zip,
         bill_phone=secrets.bill_phone,
         bill_email=secrets.bill_email,
     )

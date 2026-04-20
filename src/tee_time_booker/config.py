@@ -16,6 +16,11 @@ class Secrets(BaseSettings):
     member_id: str
     bill_firstname: str
     bill_lastname: str
+    bill_address1: str
+    bill_address2: str = ""
+    bill_city: str
+    bill_state: str
+    bill_zip: str
     bill_phone: str
     bill_email: str
 
