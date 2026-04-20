@@ -1,1 +1,3 @@
-"""tee-time-booker: a personal tee-time reservation assistant."""
+from tee_time_booker.cli import cli as main
+
+__all__ = ["main"]
