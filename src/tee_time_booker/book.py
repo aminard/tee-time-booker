@@ -271,7 +271,8 @@ async def run_booking(session: BookingSession, plan, secrets, *, dry_run: bool =
 
 
 async def _smoke_test() -> None:
-    """Run a dry-run booking end-to-end and print the result."""
+    """Run a booking end-to-end. Defaults to dry-run; set BOOK_FOR_REAL=1 to commit."""
+    import os
     import sys
 
     from dotenv import load_dotenv
@@ -284,15 +285,20 @@ async def _smoke_test() -> None:
 
     plan_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("plans/example.yaml")
     plan = load_plan(plan_path)
+    dry_run = os.getenv("BOOK_FOR_REAL", "0") != "1"
+
+    if not dry_run:
+        print("!! BOOK_FOR_REAL=1 set — this will COMMIT a real reservation. !!")
 
     async with await login(
         secrets.username,
         secrets.password.get_secret_value(),
         secrets.base_url,
     ) as session:
-        result = await run_booking(session, plan, secrets, dry_run=True)
+        result = await run_booking(session, plan, secrets, dry_run=dry_run)
 
-    print("\n=== DRY RUN COMPLETE ===")
+    header = "=== DRY RUN COMPLETE ===" if dry_run else "=== BOOKING COMMITTED ==="
+    print(f"\n{header}")
     print(f"Steps completed: {' → '.join(result.steps_completed)}")
     if result.slot:
         print(
@@ -304,9 +310,14 @@ async def _smoke_test() -> None:
         cf = result.checkout_form
         print(f"Checkout form:   action={cf.action_url}")
         print(f"                 hidden fields: {sorted(cf.hidden_fields.keys())}")
+    if result.confirmation_url:
+        print(f"Confirmation:    {result.confirmation_url}")
     print()
-    print("The slot is now held in your cart. It will auto-release after 15 min of")
-    print("inactivity, or you can sign in to the platform and remove it manually.")
+    if dry_run:
+        print("The slot is now held in your cart. It will auto-release after 15 min of")
+        print("inactivity, or you can sign in to the platform and remove it manually.")
+    else:
+        print("A real reservation was just created. You should receive a confirmation email.")
 
 
 if __name__ == "__main__":
