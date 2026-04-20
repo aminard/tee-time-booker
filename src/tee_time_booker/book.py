@@ -1,17 +1,24 @@
-"""Booking-flow orchestration.
+"""Booking- and cancellation-flow orchestration.
 
-Pipeline: search → pick slot → claim (GET) → player selection (POST) →
+Booking pipeline: search → pick slot → claim (GET) → player selection (POST) →
 advance to cart → load checkout form → (optional) finalize POST.
 
-A caller in dry-run mode stops after loading the checkout form. The slot is
-held in the cart during the 15-minute inactivity timeout, then released
+Cancellation pipeline: cancel-search (POST) → add-cancellation-to-cart (GET) →
+advance to cart → load checkout form → (optional) finalize POST. The two
+pipelines merge at the cart step — the final POST is identical (Action=
+ProcessSale), and the platform determines book-vs-cancel from cart contents.
+
+In dry-run mode, both flows stop after loading the checkout form. The slot
+is held in the cart during the 15-minute inactivity timeout, then released
 automatically. No binding POST is ever sent unless `dry_run=False`.
 
-All HTTP uses Playwright's `context.request` via BookingSession so every
-request shares the exact network fingerprint of the browser that logged in.
+All HTTP goes through Playwright's real browser network stack (page.goto and
+in-page fetch) so every request shares the TLS/session fingerprint of the
+browser that logged in.
 """
 
 from dataclasses import dataclass, field
+from datetime import time as dtime
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -271,6 +278,124 @@ async def run_booking(session: BookingSession, plan, secrets, *, dry_run: bool =
 
     if dry_run:
         log.warning("run_booking: DRY RUN stop — slot held in cart; no binding POST")
+        return result
+
+    result.confirmation_url = await finalize_booking(
+        session,
+        result.checkout_form,
+        bill_firstname=secrets.bill_firstname,
+        bill_lastname=secrets.bill_lastname,
+        bill_address1=secrets.bill_address1,
+        bill_address2=secrets.bill_address2,
+        bill_city=secrets.bill_city,
+        bill_state=secrets.bill_state,
+        bill_zip=secrets.bill_zip,
+        bill_phone=secrets.bill_phone,
+        bill_email=secrets.bill_email,
+    )
+    result.steps_completed.append("finalize")
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Cancellation flow
+# ---------------------------------------------------------------------------
+
+
+async def cancel_search(
+    session: BookingSession,
+    csrf_token: str,
+    confirmation_numbers: list[str],
+    tee_time: dtime,
+) -> str:
+    """POST teetimecancel.html with confirmation numbers and tee-time.
+
+    The platform expects a single comma-separated `confirmationnumber` field
+    and the tee-time split across three fields: hour (1-12), minute, AM/PM.
+    """
+    hour = tee_time.strftime("%I").lstrip("0") or "12"
+    minute = tee_time.strftime("%M")
+    ampm = tee_time.strftime("%p")
+
+    fields = {
+        "Action": "Process",
+        "SubAction": "",
+        "_csrf_token": csrf_token,
+        "webteetimecancel_confirmationnumber": ",".join(confirmation_numbers),
+        "webteetimecancel_teetimeslot1": hour,
+        "webteetimecancel_teetimeslot2": minute,
+        "webteetimecancel_teetimeslot3": ampm,
+        "webteetimecancel_buttonsearch": "yes",
+    }
+    log.info(
+        "cancel_search: POST",
+        confirmation_numbers=confirmation_numbers,
+        tee_time=tee_time.isoformat(timespec="minutes"),
+    )
+    resp = await session.post_form(f"{session.base_url}/teetimecancel.html", fields)
+    log.info("cancel_search: response", status=resp.status, url=resp.url)
+    if not resp.ok:
+        raise RuntimeError(f"cancel_search: HTTP {resp.status}")
+    return resp.text
+
+
+async def add_cancellation_to_cart(
+    session: BookingSession, csrf_token: str, confirmation_numbers: list[str]
+) -> str:
+    """GET addtocart.html?action=cancellation — populates the cart with cancel items.
+
+    The platform redirects this through addtocart?subaction=start2 and lands
+    on cart.html; page.goto follows the chain and returns the final cart HTML.
+    """
+    params = {
+        "action": "cancellation",
+        "fmidlist": ",".join(f"GR{n}" for n in confirmation_numbers),
+        "module": MODULE,
+        "SADetailIDList": ",".join(confirmation_numbers),
+        "_csrf_token": csrf_token,
+    }
+    url = f"{session.base_url}/addtocart.html?{urlencode(params)}"
+    log.info("add_cancellation_to_cart: GET", url=url)
+    resp = await session.get(url)
+    log.info(
+        "add_cancellation_to_cart: response", status=resp.status, final_url=resp.url
+    )
+    if not resp.ok:
+        raise RuntimeError(f"add_cancellation_to_cart: HTTP {resp.status}")
+    return resp.text
+
+
+async def run_cancellation(
+    session: BookingSession,
+    confirmation_numbers: list[str],
+    tee_time: dtime,
+    secrets,
+    *,
+    dry_run: bool = True,
+) -> BookingResult:
+    """Full cancellation pipeline. Stops before the binding POST when dry_run=True.
+
+    In dry-run, cancel items are added to the cart and held during the 15-min
+    inactivity timeout, then cleared by the platform. The reservation remains
+    active.
+    """
+    result = BookingResult(dry_run=dry_run)
+    csrf = session.csrf_token
+
+    search_html = await cancel_search(session, csrf, confirmation_numbers, tee_time)
+    result.steps_completed.append("cancel_search")
+    csrf = _scrape_csrf(search_html) or csrf
+
+    cart_html = await add_cancellation_to_cart(session, csrf, confirmation_numbers)
+    result.steps_completed.append("cancel_claim")
+    csrf = _scrape_csrf(cart_html) or csrf
+
+    result.checkout_form = await load_checkout_form(session, csrf)
+    result.steps_completed.append("checkout")
+
+    if dry_run:
+        log.warning("run_cancellation: DRY RUN stop — cancellation in cart; no binding POST")
         return result
 
     result.confirmation_url = await finalize_booking(
