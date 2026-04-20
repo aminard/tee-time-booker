@@ -1,0 +1,35 @@
+[project]
+name = "tee-time-booker"
+version = "0.1.0"
+description = "A personal tee-time reservation assistant for municipal golf courses in Austin, TX."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "beautifulsoup4>=4.14.3",
+    "click>=8.3.2",
+    "curl-cffi>=0.15.0",
+    "httpx[http2]>=0.28.1",
+    "lxml>=6.1.0",
+    "ntplib>=0.4.0",
+    "playwright>=1.58.0",
+    "pydantic>=2.13.2",
+    "pydantic-settings>=2.13.1",
+    "python-dotenv>=1.2.2",
+    "pyyaml>=6.0.3",
+    "structlog>=25.5.0",
+]
+
+[project.scripts]
+tee-time-booker = "tee_time_booker:main"
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.408",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.3.0",
+    "ruff>=0.15.11",
+]
