@@ -1,0 +1,13 @@
+target_date: 2026-04-22
+earliest_time: "08:00"
+latest_time: "12:00"
+holes: 18
+num_players: 4
+courses:
+  - morris_williams
+  - jimmy_clay
+  - roy_kizer
+preferred_course_order:
+  - morris_williams
+  - roy_kizer
+  - jimmy_clay
