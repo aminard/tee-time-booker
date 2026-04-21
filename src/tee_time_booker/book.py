@@ -18,7 +18,6 @@ browser that logged in.
 """
 
 import asyncio
-import random
 from dataclasses import dataclass, field
 from datetime import time as dtime, timedelta
 from pathlib import Path
@@ -444,7 +443,6 @@ async def run_scheduled_booking(
     dry_run: bool = True,
     lead_time_sec: int = 30,
     headless: bool = False,
-    post_open_jitter_ms: tuple[int, int] = (50, 300),
     keepalive_interval_sec: int = 90,
     auth_lead_sec: int = 60,
     final_quiet_sec: int = 5,
@@ -460,8 +458,7 @@ async def run_scheduled_booking(
          keepalive_interval_sec)
       5. Authenticate at T - auth_lead_sec
       6. Quiet sleep until T - final_quiet_sec, then tight wait to T = 0
-      7. Post-open jitter (default 50-300 ms)
-      8. Fire the booking pipeline
+      7. Fire the booking pipeline
 
     For short lead windows (weekday opens with no waiting room, default
     lead_time_sec=30), steps 3-5 collapse into a single combined login
@@ -522,7 +519,6 @@ async def run_scheduled_booking(
         ) as session:
             return await _wait_and_book(
                 session, plan, secrets, clock, opens_at,
-                post_open_jitter_ms=post_open_jitter_ms,
                 final_quiet_sec=final_quiet_sec,
                 dry_run=dry_run,
             )
@@ -555,7 +551,6 @@ async def run_scheduled_booking(
 
         return await _wait_and_book(
             session, plan, secrets, clock, opens_at,
-            post_open_jitter_ms=post_open_jitter_ms,
             final_quiet_sec=final_quiet_sec,
             dry_run=dry_run,
         )
@@ -568,19 +563,15 @@ async def _wait_and_book(
     clock,
     opens_at,
     *,
-    post_open_jitter_ms: tuple[int, int],
     final_quiet_sec: int,
     dry_run: bool,
 ) -> BookingResult:
-    """Quiet wait until booking opens, jitter, then fire the booking pipeline."""
+    """Quiet wait until booking opens, then fire the booking pipeline."""
     wait_s = (opens_at - clock.now_utc()).total_seconds()
     log.info("waiting until booking opens", wait_seconds=round(wait_s, 3))
     await clock.sleep_until(opens_at)
 
-    jitter_ms = random.randint(*post_open_jitter_ms)
-    log.info("booking open; jittering before firing", jitter_ms=jitter_ms)
-    await asyncio.sleep(jitter_ms / 1000)
-
+    log.info("booking open; firing pipeline")
     return await run_booking(session, plan, secrets, dry_run=dry_run)
 
 
