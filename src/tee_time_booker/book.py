@@ -444,6 +444,8 @@ async def run_scheduled_booking(
     lead_time_sec: int = 30,
     headless: bool = False,
     keepalive_interval_sec: int = 90,
+    keepalive_fast_interval_sec: int = 30,
+    keepalive_fast_duration_sec: int = 1200,
     auth_lead_sec: int = 60,
     final_quiet_sec: int = 5,
 ) -> BookingResult:
@@ -537,7 +539,10 @@ async def run_scheduled_booking(
                 auth_lead_sec=auth_lead_sec,
             )
             await session.keepalive(
-                clock, auth_at, interval_sec=keepalive_interval_sec
+                clock, auth_at,
+                interval_sec=keepalive_interval_sec,
+                fast_interval_sec=keepalive_fast_interval_sec,
+                fast_duration_sec=keepalive_fast_duration_sec,
             )
 
         # Authenticate.

@@ -15,6 +15,7 @@ through.
 """
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 from datetime import date as ddate, datetime, timedelta
 from typing import Any
@@ -52,6 +53,41 @@ async def has_queue_pass(context: BrowserContext, target_date: ddate) -> bool:
     return False
 
 
+async def _scrape_queue_metadata(page: Page) -> dict[str, str]:
+    """Pull diagnostic fields off the waiting-room page.
+
+    The page exposes some human-readable state (status-updated timestamp,
+    queue id, headline) that's useful for understanding how the queue is
+    progressing — especially helpful when iterating on queue behavior
+    between release events, since we only see one event per week.
+    """
+    try:
+        body_text = await page.evaluate("document.body.innerText")
+    except Exception as e:
+        return {"scrape_error": str(e)}
+
+    meta: dict[str, str] = {}
+
+    m = re.search(r"Status last updated:\s*([^\r\n]+)", body_text)
+    if m:
+        meta["status_updated"] = m.group(1).strip()
+
+    m = re.search(r"Queue ID:?\s*([0-9a-f-]{20,})", body_text)
+    if m:
+        meta["queue_id"] = m.group(1).strip()
+
+    # First non-empty line often contains the event headline (e.g. "Tee Time
+    # Launch 04/27 - You're in line..."). Useful if we want to confirm
+    # we're in the right event's queue.
+    for line in body_text.splitlines():
+        line = line.strip()
+        if line and len(line) < 200:
+            meta["headline"] = line
+            break
+
+    return meta
+
+
 async def wait_for_queue_release(
     page: Page,
     *,
@@ -63,7 +99,9 @@ async def wait_for_queue_release(
 
     The waiting room JS polls its own status endpoint and triggers a full
     redirect back to the target URL when our turn is up, so we just watch
-    the page URL. Progress is logged every ~30 sec for observability.
+    the page URL. Progress is logged every ~30 sec for observability,
+    including any queue metadata we can scrape off the page (status
+    timestamp, queue id) so we have a richer dataset to reason about.
 
     The 4 h default timeout is deliberately loose. The right frame isn't
     "how long am I willing to sit in the queue" but "how long past the
@@ -77,10 +115,12 @@ async def wait_for_queue_release(
     loop = asyncio.get_event_loop()
     start = loop.time()
     last_log = start
+    initial_meta = await _scrape_queue_metadata(page)
     log.warning(
         "virtual waiting room: entered",
         url=page.url,
         title=await page.title(),
+        **initial_meta,
     )
     while True:
         if not is_in_queue(page):
@@ -101,10 +141,12 @@ async def wait_for_queue_release(
                 f"virtual waiting room: timed out after {timeout_sec}s (still on {page.url})"
             )
         if loop.time() - last_log >= log_interval_sec:
+            meta = await _scrape_queue_metadata(page)
             log.info(
                 "virtual waiting room: still waiting",
                 wait_seconds=round(elapsed, 1),
                 url=page.url,
+                **meta,
             )
             last_log = loop.time()
         await asyncio.sleep(poll_interval_sec)
@@ -181,6 +223,8 @@ class BookingSession:
         deadline_utc: datetime,
         *,
         interval_sec: int = 90,
+        fast_interval_sec: int | None = None,
+        fast_duration_sec: int = 1200,
     ) -> None:
         """Refresh splash.html periodically until `deadline_utc`.
 
@@ -190,13 +234,22 @@ class BookingSession:
           (2) Detect virtual-waiting-room activation during the idle period;
               if a refresh lands us in the queue, we wait for release.
 
+        Adaptive cadence: if `fast_interval_sec` is set, the loop uses that
+        tighter interval for the first `fast_duration_sec` seconds (useful
+        for narrowing down when a waiting room first activates), then relaxes
+        to `interval_sec` for the remainder. Pass None (default) to use a
+        flat `interval_sec` throughout.
+
         `clock` is a tee_time_booker.clock.Clock (offset-corrected NTP wrapper).
         """
         splash_url = f"{self.base_url}/splash.html"
+        start_utc = clock.now_utc()
         log.info(
             "keepalive: starting",
             deadline_utc=deadline_utc.isoformat(),
             interval_sec=interval_sec,
+            fast_interval_sec=fast_interval_sec,
+            fast_duration_sec=fast_duration_sec if fast_interval_sec else None,
         )
         while True:
             now = clock.now_utc()
@@ -204,7 +257,14 @@ class BookingSession:
                 log.info("keepalive: deadline reached")
                 return
 
-            next_tick = min(now + timedelta(seconds=interval_sec), deadline_utc)
+            # Pick the active interval based on elapsed time.
+            elapsed_sec = (now - start_utc).total_seconds()
+            if fast_interval_sec is not None and elapsed_sec < fast_duration_sec:
+                active_interval = fast_interval_sec
+            else:
+                active_interval = interval_sec
+
+            next_tick = min(now + timedelta(seconds=active_interval), deadline_utc)
             await clock.sleep_until(next_tick)
 
             if clock.now_utc() >= deadline_utc:
