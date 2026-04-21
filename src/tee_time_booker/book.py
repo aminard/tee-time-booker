@@ -445,20 +445,29 @@ async def run_scheduled_booking(
     lead_time_sec: int = 30,
     headless: bool = False,
     post_release_jitter_ms: tuple[int, int] = (50, 300),
+    keepalive_interval_sec: int = 90,
+    final_quiet_sec: int = 30,
 ) -> BookingResult:
     """Run a booking, waiting until the plan's release moment before firing.
 
     Timeline:
       1. Sync clock against NTP (~200 ms)
       2. Sleep until T - lead_time_sec
-      3. Log in (takes ~3-5 s)
-      4. Sleep until T = 0 (release moment)
-      5. Sleep a small random jitter (default 50-300 ms) after release
-      6. Fire the booking pipeline (search → claim → …)
+      3. Log in (handles virtual-waiting-room redirect if present)
+      4. If >final_quiet_sec remain, run keepalive heartbeat until T - final_quiet_sec
+         (periodic splash refresh to keep short-TTL cookies warm and detect
+         mid-session queue activation)
+      5. Sleep until T = 0 (release moment)
+      6. Sleep a small random jitter (default 50-300 ms) after release
+      7. Fire the booking pipeline (search → claim → …)
 
     The post-release jitter serves two purposes: it makes the timing look
     less mechanically uniform, and it gives the server's caches a moment to
     finish propagating the newly-released slots before we search for them.
+
+    For release windows with a virtual waiting room (observed on weekend
+    tee-time releases), pass a large `lead_time_sec` (e.g. 3600) so we can
+    enter the queue early, wait through it, and be ready when T=0 hits.
 
     If the release moment has already passed, fires immediately without
     waiting or jittering.
@@ -476,6 +485,7 @@ async def run_scheduled_booking(
         release_utc=release.isoformat(),
         now_utc=now.isoformat(),
         offset_ms=clock.offset_seconds * 1000,
+        lead_time_sec=lead_time_sec,
     )
 
     if now >= release:
@@ -504,8 +514,24 @@ async def run_scheduled_booking(
         secrets.base_url,
         headless=headless,
     ) as session:
+        # Long idle wait? Use keepalive to preserve cookies and detect
+        # mid-session queue activation. Otherwise, straight sleep.
+        keepalive_end = release - timedelta(seconds=final_quiet_sec)
+        now = clock.now_utc()
+        if now < keepalive_end and (keepalive_end - now).total_seconds() > keepalive_interval_sec:
+            wait_s = (keepalive_end - now).total_seconds()
+            log.info(
+                "logged in, starting keepalive until quiet window",
+                wait_seconds=round(wait_s, 1),
+                interval_sec=keepalive_interval_sec,
+                final_quiet_sec=final_quiet_sec,
+            )
+            await session.keepalive(
+                clock, keepalive_end, interval_sec=keepalive_interval_sec
+            )
+
         wait_s = (release - clock.now_utc()).total_seconds()
-        log.info("logged in, waiting for release moment", wait_seconds=wait_s)
+        log.info("quiet window: waiting for release moment", wait_seconds=round(wait_s, 3))
         await clock.sleep_until(release)
 
         jitter_ms = random.randint(*post_release_jitter_ms)

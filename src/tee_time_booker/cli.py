@@ -17,16 +17,23 @@ def plan() -> None:
 @cli.command()
 @click.argument("plan_path", type=click.Path(exists=True, path_type=Path))
 @click.option("--confirm", is_flag=True, help="The scheduled run will commit the booking (default: dry-run).")
-@click.option("--lead-minutes", type=int, default=3, show_default=True,
-              help="Minutes before release to launch the process (buffers launchd jitter + login time).")
-def schedule(plan_path: Path, confirm: bool, lead_minutes: int) -> None:
+@click.option("--lead-minutes", type=int, default=None, show_default="auto",
+              help="Minutes before release to launch the bot process (buffers launchd jitter + Python startup). "
+                   "Auto-sized to login-lead-seconds + 2 min if omitted.")
+@click.option("--login-lead-seconds", type=int, default=30, show_default=True,
+              help="Seconds before release the bot should be logged in and idling. "
+                   "Use a large value (e.g. 3600 = 60 min) for weekend releases "
+                   "that route through a virtual waiting room.")
+def schedule(plan_path: Path, confirm: bool, lead_minutes: int | None, login_lead_seconds: int) -> None:
     """Generate a launchd plist to run the bot automatically at a plan's release moment.
 
     Writes a .plist into ~/Library/LaunchAgents/ that fires the bot a few
-    minutes before release. The bot then NTP-syncs and waits for the precise
-    instant before claiming the slot.
+    minutes before release. The bot then NTP-syncs, logs in (waiting through
+    a virtual waiting room if present), and fires the booking at T=0.
 
-    Your Mac must be awake and logged into your user account at fire time.
+    Your Mac must be awake and logged into your user account at fire time,
+    AND stay awake through the booking moment. For long login-lead windows,
+    use `caffeinate -d` to prevent sleep.
     """
     import shutil
     from datetime import timedelta
@@ -34,6 +41,16 @@ def schedule(plan_path: Path, confirm: bool, lead_minutes: int) -> None:
     from tee_time_booker.clock import compute_release_moment
     from tee_time_booker.config import load_plan
     from tee_time_booker.constants import CENTRAL
+
+    # Auto-size launchd firing lead = login_lead + 2 min buffer for Python startup + NTP.
+    if lead_minutes is None:
+        lead_minutes = max(3, (login_lead_seconds + 119) // 60 + 2)
+    elif lead_minutes * 60 < login_lead_seconds + 60:
+        raise click.UsageError(
+            f"--lead-minutes ({lead_minutes}) must be at least "
+            f"{(login_lead_seconds + 119) // 60 + 1} to cover --login-lead-seconds "
+            f"({login_lead_seconds}) plus startup buffer."
+        )
 
     plan = load_plan(plan_path)
     release_utc = compute_release_moment(plan.target_date)
@@ -72,6 +89,8 @@ def schedule(plan_path: Path, confirm: bool, lead_minutes: int) -> None:
         <string>{project_dir}</string>
         <string>tee-time-booker</string>
         <string>run</string>
+        <string>--login-lead-seconds</string>
+        <string>{login_lead_seconds}</string>
         <string>{flag}</string>
         <string>{plan_abs}</string>
     </array>
@@ -97,9 +116,12 @@ def schedule(plan_path: Path, confirm: bool, lead_minutes: int) -> None:
     plist_path.write_text(plist)
 
     release_ct = release_utc.astimezone(CENTRAL)
+    login_at_local = (release_utc - timedelta(seconds=login_lead_seconds)).astimezone()
     click.echo(f"Plist written:  {plist_path}")
     click.echo(f"Fire time:      {fire_at_local.strftime('%a %Y-%m-%d %I:%M %p %Z')} "
                f"(lead {lead_minutes} min)")
+    click.echo(f"Login at:       {login_at_local.strftime('%a %Y-%m-%d %I:%M:%S %p %Z')} "
+               f"(lead {login_lead_seconds} sec)")
     click.echo(f"Release moment: {release_ct.strftime('%a %Y-%m-%d %I:%M:%S %p %Z')}")
     click.echo(f"Mode:           {'REAL BOOKING (--confirm)' if confirm else 'dry-run'}")
     click.echo()
@@ -120,7 +142,10 @@ def schedule(plan_path: Path, confirm: bool, lead_minutes: int) -> None:
 @click.argument("plan_path", type=click.Path(exists=True, path_type=Path))
 @click.option("--dry-run", is_flag=True, help="Run full flow but stop before the binding POST.")
 @click.option("--confirm", is_flag=True, help="Required for a real booking (no-op without it).")
-def run(plan_path: Path, dry_run: bool, confirm: bool) -> None:
+@click.option("--login-lead-seconds", type=int, default=30, show_default=True,
+              help="Seconds before release to be logged in and idling. Use a large "
+                   "value (e.g. 3600) for release windows with a virtual waiting room.")
+def run(plan_path: Path, dry_run: bool, confirm: bool, login_lead_seconds: int) -> None:
     """Execute a booking run against a plan.
 
     Waits until the plan's release moment (NTP-synced) before firing. If the
@@ -163,7 +188,11 @@ def run(plan_path: Path, dry_run: bool, confirm: bool) -> None:
     error = None
     error_traceback = None
     try:
-        result = asyncio.run(run_scheduled_booking(plan, secrets, dry_run=not confirm))
+        result = asyncio.run(
+            run_scheduled_booking(
+                plan, secrets, dry_run=not confirm, lead_time_sec=login_lead_seconds
+            )
+        )
     except Exception as e:
         error = e
         error_traceback = traceback.format_exc()

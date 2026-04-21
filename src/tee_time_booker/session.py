@@ -5,10 +5,17 @@ in-page `fetch()` via `page.evaluate` (for POSTs).
 Using the page navigation stack — rather than Playwright's separate
 `context.request` API — is what actually shares TLS + cookies + any
 additional state the server expects from a real browser.
+
+Some release windows run behind a virtual waiting room. When the platform
+redirects us to it, we wait for the queue to release us automatically
+(detected via URL leaving the queue host). Once released, a signed pass
+cookie is set on the platform domain and persists for ~24 hours, so
+subsequent navigations in the same browser context sail through.
 """
 
 import asyncio
 from dataclasses import dataclass, field
+from datetime import date as ddate, datetime, timedelta
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -16,6 +23,81 @@ import structlog
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 log = structlog.get_logger()
+
+
+# ---------------------------------------------------------------------------
+# Virtual waiting room handling
+# ---------------------------------------------------------------------------
+
+QUEUE_HOST = "queue-it.net"
+
+
+def is_in_queue(page: Page) -> bool:
+    """True if the page's current URL is a virtual waiting room."""
+    return QUEUE_HOST in (page.url or "")
+
+
+async def has_queue_pass(context: BrowserContext, target_date: ddate) -> bool:
+    """True if the context holds a signed pass cookie for this release event.
+
+    The pass is issued by the waiting room and set on the platform domain
+    when it releases us. Name format observed: `QueueITAccepted-*_txaustin{YYYYMMDD}`.
+    """
+    suffix = f"txaustin{target_date.strftime('%Y%m%d')}"
+    for c in await context.cookies():
+        name = c.get("name", "")
+        if name.startswith("QueueITAccepted-") and name.endswith(suffix):
+            return True
+    return False
+
+
+async def wait_for_queue_release(
+    page: Page,
+    *,
+    poll_interval_sec: float = 2.0,
+    log_interval_sec: float = 30.0,
+    timeout_sec: int = 3600,
+) -> None:
+    """Block until the page navigates out of the virtual waiting room.
+
+    The waiting room JS polls its own status endpoint and triggers a full
+    redirect back to the target URL when our turn is up, so we just watch
+    the page URL. Progress is logged every ~30 sec for observability.
+    """
+    loop = asyncio.get_event_loop()
+    start = loop.time()
+    last_log = start
+    log.warning(
+        "virtual waiting room: entered",
+        url=page.url,
+        title=await page.title(),
+    )
+    while True:
+        if not is_in_queue(page):
+            log.info(
+                "virtual waiting room: released",
+                wait_seconds=round(loop.time() - start, 1),
+                url=page.url,
+            )
+            try:
+                await page.wait_for_load_state("networkidle", timeout=15_000)
+            except Exception:
+                pass
+            return
+
+        elapsed = loop.time() - start
+        if elapsed >= timeout_sec:
+            raise RuntimeError(
+                f"virtual waiting room: timed out after {timeout_sec}s (still on {page.url})"
+            )
+        if loop.time() - last_log >= log_interval_sec:
+            log.info(
+                "virtual waiting room: still waiting",
+                wait_seconds=round(elapsed, 1),
+                url=page.url,
+            )
+            last_log = loop.time()
+        await asyncio.sleep(poll_interval_sec)
 
 
 @dataclass
@@ -73,6 +155,67 @@ class BookingSession:
     async def post_form(self, url: str, fields: dict[str, str]) -> Response:
         """Submit an application/x-www-form-urlencoded POST via in-page fetch()."""
         return await self._fetch(url, body_type="urlencoded", fields=fields)
+
+    async def keepalive(
+        self,
+        clock: Any,
+        deadline_utc: datetime,
+        *,
+        interval_sec: int = 90,
+    ) -> None:
+        """Refresh splash.html periodically until `deadline_utc`.
+
+        Purpose: two-fold.
+          (1) Keep short-TTL platform cookies (Cloudflare bot-management etc.)
+              from expiring during long idle waits.
+          (2) Detect virtual-waiting-room activation during the idle period;
+              if a refresh lands us in the queue, we wait for release.
+
+        `clock` is a tee_time_booker.clock.Clock (offset-corrected NTP wrapper).
+        """
+        splash_url = f"{self.base_url}/splash.html"
+        log.info(
+            "keepalive: starting",
+            deadline_utc=deadline_utc.isoformat(),
+            interval_sec=interval_sec,
+        )
+        while True:
+            now = clock.now_utc()
+            if now >= deadline_utc:
+                log.info("keepalive: deadline reached")
+                return
+
+            next_tick = min(now + timedelta(seconds=interval_sec), deadline_utc)
+            await clock.sleep_until(next_tick)
+
+            if clock.now_utc() >= deadline_utc:
+                log.info("keepalive: deadline reached")
+                return
+
+            try:
+                log.info("keepalive: refreshing splash", url=splash_url)
+                await self._page.goto(splash_url, wait_until="networkidle")
+                if is_in_queue(self._page):
+                    log.warning(
+                        "keepalive: virtual waiting room encountered mid-session"
+                    )
+                    await wait_for_queue_release(self._page)
+                    # Queue may have bounced us to a logged-out state. Detect
+                    # and log — v1 doesn't re-login automatically.
+                    login_form = self._page.locator('input[name="weblogin_username"]')
+                    if await login_form.count() > 0:
+                        log.error(
+                            "keepalive: login form visible after queue release — "
+                            "session lost; subsequent booking calls will likely fail",
+                        )
+                else:
+                    log.info(
+                        "keepalive: refresh ok",
+                        title=await self._page.title(),
+                        url=self._page.url,
+                    )
+            except Exception as e:
+                log.warning("keepalive: refresh errored", error=str(e))
 
     async def _fetch(
         self, url: str, *, body_type: str, fields: dict[str, str]
@@ -139,6 +282,14 @@ async def login(
         login_landing = f"{base_url}/splash.html"
         log.info("loading landing page", url=login_landing)
         await page.goto(login_landing, wait_until="networkidle")
+
+        # During high-traffic release windows, the platform redirects all
+        # incoming traffic through a virtual waiting room. If we land there,
+        # block until the queue releases us (signed pass cookie is issued
+        # on release and the page auto-redirects back to splash).
+        if is_in_queue(page):
+            log.warning("login: virtual waiting room detected on landing")
+            await wait_for_queue_release(page)
 
         username_input = page.locator('input[name="weblogin_username"]')
         try:
@@ -232,11 +383,70 @@ async def _smoke_test() -> None:
         print(f"\nGET /splash.html -> HTTP {resp.status} ({len(resp.text)} bytes)")
 
 
+async def _smoke_test_keepalive() -> None:
+    """Log in, then run keepalive for KEEPALIVE_DURATION_SEC (default 240s / 4 min).
+
+    Expected behavior:
+      - Login succeeds (queue wait is a no-op since queue isn't active)
+      - Keepalive refreshes splash every 90 sec (so 2-3 cycles in 4 min)
+      - Each refresh logs status + URL
+      - Clean exit when deadline is reached
+    """
+    import os
+
+    from dotenv import load_dotenv
+
+    from tee_time_booker.clock import sync_clock
+    from tee_time_booker.config import Secrets
+
+    load_dotenv()
+    secrets = Secrets()  # type: ignore[call-arg]
+
+    duration_sec = int(os.getenv("KEEPALIVE_DURATION_SEC", "240"))
+    interval_sec = int(os.getenv("KEEPALIVE_INTERVAL_SEC", "90"))
+    headless = os.getenv("HEADLESS", "0") == "1"
+
+    log.info(
+        "starting keepalive smoke test",
+        username=secrets.username,
+        duration_sec=duration_sec,
+        interval_sec=interval_sec,
+    )
+
+    clock = await sync_clock()
+
+    async with await login(
+        secrets.username,
+        secrets.password.get_secret_value(),
+        secrets.base_url,
+        headless=headless,
+    ) as sess:
+        print(f"\nLogged in. User-Agent: {sess.user_agent}")
+        print(f"Running keepalive for {duration_sec}s "
+              f"(interval {interval_sec}s, expect {duration_sec // interval_sec} refresh cycles).")
+        print("Watch the browser — splash.html should reload every ~90s.\n")
+
+        deadline = clock.now_utc() + timedelta(seconds=duration_sec)
+        await sess.keepalive(clock, deadline, interval_sec=interval_sec)
+
+        print("\nKeepalive complete. Queue pass check:", end=" ")
+        from datetime import date as _date
+        # Dummy date — we just want to exercise the cookie lookup path.
+        has_pass = await has_queue_pass(sess._context, _date.today())
+        print(f"has_queue_pass(today) = {has_pass}")
+
+
 if __name__ == "__main__":
+    import os
+
     structlog.configure(
         processors=[
             structlog.processors.TimeStamper(fmt="iso"),
             structlog.dev.ConsoleRenderer(),
         ],
     )
-    asyncio.run(_smoke_test())
+    mode = os.getenv("SMOKE_MODE", "login")
+    if mode == "keepalive":
+        asyncio.run(_smoke_test_keepalive())
+    else:
+        asyncio.run(_smoke_test())
