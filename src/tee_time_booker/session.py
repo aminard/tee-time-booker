@@ -56,7 +56,7 @@ async def wait_for_queue_release(
     *,
     poll_interval_sec: float = 2.0,
     log_interval_sec: float = 30.0,
-    timeout_sec: int = 7200,
+    timeout_sec: int = 14400,
 ) -> None:
     """Block until the page navigates out of the virtual waiting room.
 
@@ -64,11 +64,13 @@ async def wait_for_queue_release(
     redirect back to the target URL when our turn is up, so we just watch
     the page URL. Progress is logged every ~30 sec for observability.
 
-    The 2 h default timeout is deliberately loose: if we entered the queue
-    around 7 PM and the wait runs longer than expected (past the 8 PM
-    release moment), we still want to attempt the booking once released —
-    the queue pass cookie is valid for 24 h and slots may still be
-    available post-release. Better to try and fail than to give up early.
+    The 4 h default timeout is deliberately loose. The right frame isn't
+    "how long am I willing to sit in the queue" but "how long past the
+    release moment am I willing to keep trying to book." Arriving hours
+    early for data-gathering + being willing to wait ~1-2 h past release
+    (slots can linger) adds up to ~4 h. The 24 h queue-pass cookie means
+    once through, subsequent navigations are cheap. Better to try and
+    fail on stale slots than to give up before the queue even clears.
     """
     loop = asyncio.get_event_loop()
     start = loop.time()
