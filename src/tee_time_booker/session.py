@@ -56,13 +56,19 @@ async def wait_for_queue_release(
     *,
     poll_interval_sec: float = 2.0,
     log_interval_sec: float = 30.0,
-    timeout_sec: int = 3600,
+    timeout_sec: int = 7200,
 ) -> None:
     """Block until the page navigates out of the virtual waiting room.
 
     The waiting room JS polls its own status endpoint and triggers a full
     redirect back to the target URL when our turn is up, so we just watch
     the page URL. Progress is logged every ~30 sec for observability.
+
+    The 2 h default timeout is deliberately loose: if we entered the queue
+    around 7 PM and the wait runs longer than expected (past the 8 PM
+    release moment), we still want to attempt the booking once released —
+    the queue pass cookie is valid for 24 h and slots may still be
+    available post-release. Better to try and fail than to give up early.
     """
     loop = asyncio.get_event_loop()
     start = loop.time()
@@ -485,6 +491,83 @@ async def _smoke_test_keepalive() -> None:
         print(f"has_queue_pass(today) = {has_pass}")
 
 
+async def _smoke_test_scheduled() -> None:
+    """Rehearse the long-lead scheduled-run timeline with a fake release
+    moment. Exits after 'release' instead of booking.
+
+    Env vars (all seconds):
+      LEAD_SEC (default 360)     — total lead from now to fake release
+      AUTH_LEAD_SEC (default 60) — login happens this far before fake release
+      KEEPALIVE_INTERVAL_SEC (default 45) — shortened from prod's 90 so we
+                                            see multiple cycles in a 6-min run
+
+    Expected sequence:
+      enter_site (~few s) → keepalive loop (≥1 cycle) → authenticate (~few s)
+      → quiet wait → 'fake release hit' log → exit 0
+    """
+    import os
+
+    from dotenv import load_dotenv
+
+    from tee_time_booker.clock import sync_clock
+    from tee_time_booker.config import Secrets
+
+    load_dotenv()
+    secrets = Secrets()  # type: ignore[call-arg]
+
+    lead_sec = int(os.getenv("LEAD_SEC", "360"))
+    auth_lead_sec = int(os.getenv("AUTH_LEAD_SEC", "60"))
+    keepalive_interval = int(os.getenv("KEEPALIVE_INTERVAL_SEC", "45"))
+    headless = os.getenv("HEADLESS", "0") == "1"
+
+    clock = await sync_clock()
+    release = clock.now_utc() + timedelta(seconds=lead_sec)
+
+    log.info(
+        "smoke scheduled: starting",
+        fake_release_utc=release.isoformat(),
+        lead_sec=lead_sec,
+        auth_lead_sec=auth_lead_sec,
+        keepalive_interval=keepalive_interval,
+    )
+    print(f"\nFake release moment: {release.isoformat(timespec='seconds')}")
+    print(f"  Lead total:         {lead_sec}s")
+    print(f"  Auth lead:          {auth_lead_sec}s (login at fake T-{auth_lead_sec}s)")
+    print(f"  Keepalive interval: {keepalive_interval}s\n")
+
+    async with await enter_site(secrets.base_url, headless=headless) as session:
+        auth_at = release - timedelta(seconds=auth_lead_sec)
+        now = clock.now_utc()
+        if now < auth_at and (auth_at - now).total_seconds() > keepalive_interval:
+            wait_s = (auth_at - now).total_seconds()
+            log.info(
+                "entered site; keepalive until auth moment",
+                wait_seconds=round(wait_s, 1),
+                interval_sec=keepalive_interval,
+            )
+            await session.keepalive(
+                clock, auth_at, interval_sec=keepalive_interval
+            )
+
+        if clock.now_utc() < auth_at:
+            await clock.sleep_until(auth_at)
+
+        log.info("auth moment reached; logging in")
+        await session.authenticate(
+            secrets.username, secrets.password.get_secret_value()
+        )
+
+        wait_s = (release - clock.now_utc()).total_seconds()
+        log.info(
+            "logged in; waiting for fake release moment",
+            wait_seconds=round(wait_s, 3),
+        )
+        await clock.sleep_until(release)
+
+        log.warning("fake release hit; WOULD fire booking now (smoke exits here)")
+        print("\n✓ Timeline rehearsal complete — all phases fired in order.")
+
+
 if __name__ == "__main__":
     import os
 
@@ -497,5 +580,7 @@ if __name__ == "__main__":
     mode = os.getenv("SMOKE_MODE", "login")
     if mode == "keepalive":
         asyncio.run(_smoke_test_keepalive())
+    elif mode == "scheduled":
+        asyncio.run(_smoke_test_scheduled())
     else:
         asyncio.run(_smoke_test())
