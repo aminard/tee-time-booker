@@ -446,34 +446,37 @@ async def run_scheduled_booking(
     headless: bool = False,
     post_release_jitter_ms: tuple[int, int] = (50, 300),
     keepalive_interval_sec: int = 90,
-    final_quiet_sec: int = 30,
+    auth_lead_sec: int = 60,
+    final_quiet_sec: int = 5,
 ) -> BookingResult:
     """Run a booking, waiting until the plan's release moment before firing.
 
-    Timeline:
+    Timeline (for long lead windows — release routes through a waiting room):
       1. Sync clock against NTP (~200 ms)
       2. Sleep until T - lead_time_sec
-      3. Log in (handles virtual-waiting-room redirect if present)
-      4. If >final_quiet_sec remain, run keepalive heartbeat until T - final_quiet_sec
-         (periodic splash refresh to keep short-TTL cookies warm and detect
-         mid-session queue activation)
-      5. Sleep until T = 0 (release moment)
-      6. Sleep a small random jitter (default 50-300 ms) after release
-      7. Fire the booking pipeline (search → claim → …)
+      3. Enter site (wait out waiting room if present) — acquires the 24h
+         queue pass cookie; no login yet
+      4. Keepalive loop until T - auth_lead_sec (splash refresh every
+         keepalive_interval_sec)
+      5. Authenticate at T - auth_lead_sec
+      6. Quiet sleep until T - final_quiet_sec, then tight wait to T = 0
+      7. Post-release jitter (default 50-300 ms)
+      8. Fire the booking pipeline
 
-    The post-release jitter serves two purposes: it makes the timing look
-    less mechanically uniform, and it gives the server's caches a moment to
-    finish propagating the newly-released slots before we search for them.
+    For short lead windows (weekday releases with no waiting room, default
+    lead_time_sec=30), steps 3-5 collapse into a single combined login
+    (equivalent to the previous behavior).
 
-    For release windows with a virtual waiting room (observed on weekend
-    tee-time releases), pass a large `lead_time_sec` (e.g. 3600) so we can
-    enter the queue early, wait through it, and be ready when T=0 hits.
+    Deferring login until after the waiting-room wait — rather than logging
+    in at T-60min and sitting idle for an hour — avoids an edge case where
+    a mid-session redirect through the waiting room invalidates the auth
+    session. Only the queue pass cookie needs to persist through the wait,
+    and that's a 24h signed token scoped to the release date.
 
-    If the release moment has already passed, fires immediately without
-    waiting or jittering.
+    If the release moment has already passed, fires immediately.
     """
     from tee_time_booker.clock import compute_release_moment, sync_clock
-    from tee_time_booker.session import login
+    from tee_time_booker.session import enter_site, login
 
     release = compute_release_moment(plan.target_date)
     clock = await sync_clock()
@@ -501,44 +504,84 @@ async def run_scheduled_booking(
         ) as session:
             return await run_booking(session, plan, secrets, dry_run=dry_run)
 
-    login_at = release - timedelta(seconds=lead_time_sec)
+    enter_at = release - timedelta(seconds=lead_time_sec)
     now = clock.now_utc()
-    if now < login_at:
-        wait_s = (login_at - now).total_seconds()
-        log.info("waiting until login moment", wait_seconds=wait_s)
-        await clock.sleep_until(login_at)
+    if now < enter_at:
+        wait_s = (enter_at - now).total_seconds()
+        log.info("waiting until site-entry moment", wait_seconds=wait_s)
+        await clock.sleep_until(enter_at)
 
-    async with await login(
-        secrets.username,
-        secrets.password.get_secret_value(),
-        secrets.base_url,
-        headless=headless,
-    ) as session:
-        # Long idle wait? Use keepalive to preserve cookies and detect
-        # mid-session queue activation. Otherwise, straight sleep.
-        keepalive_end = release - timedelta(seconds=final_quiet_sec)
+    # Short-lead path: lead_time_sec is inside the auth_lead_sec window.
+    # Combined login in one shot (preserves the weekday default behavior).
+    if lead_time_sec <= auth_lead_sec:
+        async with await login(
+            secrets.username,
+            secrets.password.get_secret_value(),
+            secrets.base_url,
+            headless=headless,
+        ) as session:
+            return await _wait_and_book(
+                session, plan, secrets, clock, release,
+                post_release_jitter_ms=post_release_jitter_ms,
+                final_quiet_sec=final_quiet_sec,
+                dry_run=dry_run,
+            )
+
+    # Long-lead path: enter site unauthenticated, keepalive, then authenticate
+    # just before release.
+    async with await enter_site(secrets.base_url, headless=headless) as session:
+        auth_at = release - timedelta(seconds=auth_lead_sec)
         now = clock.now_utc()
-        if now < keepalive_end and (keepalive_end - now).total_seconds() > keepalive_interval_sec:
-            wait_s = (keepalive_end - now).total_seconds()
+        if now < auth_at and (auth_at - now).total_seconds() > keepalive_interval_sec:
+            wait_s = (auth_at - now).total_seconds()
             log.info(
-                "logged in, starting keepalive until quiet window",
+                "entered site (unauthenticated); keepalive until auth moment",
                 wait_seconds=round(wait_s, 1),
                 interval_sec=keepalive_interval_sec,
-                final_quiet_sec=final_quiet_sec,
+                auth_lead_sec=auth_lead_sec,
             )
             await session.keepalive(
-                clock, keepalive_end, interval_sec=keepalive_interval_sec
+                clock, auth_at, interval_sec=keepalive_interval_sec
             )
 
-        wait_s = (release - clock.now_utc()).total_seconds()
-        log.info("quiet window: waiting for release moment", wait_seconds=round(wait_s, 3))
-        await clock.sleep_until(release)
+        # Authenticate.
+        remaining = (auth_at - clock.now_utc()).total_seconds()
+        if remaining > 0:
+            await clock.sleep_until(auth_at)
+        log.info("auth moment reached; logging in")
+        await session.authenticate(
+            secrets.username, secrets.password.get_secret_value()
+        )
 
-        jitter_ms = random.randint(*post_release_jitter_ms)
-        log.info("release hit; jittering before firing", jitter_ms=jitter_ms)
-        await asyncio.sleep(jitter_ms / 1000)
+        return await _wait_and_book(
+            session, plan, secrets, clock, release,
+            post_release_jitter_ms=post_release_jitter_ms,
+            final_quiet_sec=final_quiet_sec,
+            dry_run=dry_run,
+        )
 
-        return await run_booking(session, plan, secrets, dry_run=dry_run)
+
+async def _wait_and_book(
+    session,
+    plan,
+    secrets,
+    clock,
+    release,
+    *,
+    post_release_jitter_ms: tuple[int, int],
+    final_quiet_sec: int,
+    dry_run: bool,
+) -> BookingResult:
+    """Quiet wait to release, jitter, then fire the booking pipeline."""
+    wait_s = (release - clock.now_utc()).total_seconds()
+    log.info("waiting for release moment", wait_seconds=round(wait_s, 3))
+    await clock.sleep_until(release)
+
+    jitter_ms = random.randint(*post_release_jitter_ms)
+    log.info("release hit; jittering before firing", jitter_ms=jitter_ms)
+    await asyncio.sleep(jitter_ms / 1000)
+
+    return await run_booking(session, plan, secrets, dry_run=dry_run)
 
 
 # ---------------------------------------------------------------------------

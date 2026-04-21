@@ -21,9 +21,10 @@ def plan() -> None:
               help="Minutes before release to launch the bot process (buffers launchd jitter + Python startup). "
                    "Auto-sized to login-lead-seconds + 2 min if omitted.")
 @click.option("--login-lead-seconds", type=int, default=30, show_default=True,
-              help="Seconds before release the bot should be logged in and idling. "
-                   "Use a large value (e.g. 3600 = 60 min) for weekend releases "
-                   "that route through a virtual waiting room.")
+              help="Seconds before release to start the bot's site session. "
+                   "For long leads (>60s), the bot enters the site and idles through "
+                   "any waiting room, then authenticates ~60s before release. Use a "
+                   "large value (e.g. 3600 = 60 min) for weekend releases.")
 def schedule(plan_path: Path, confirm: bool, lead_minutes: int | None, login_lead_seconds: int) -> None:
     """Generate a launchd plist to run the bot automatically at a plan's release moment.
 
@@ -116,12 +117,16 @@ def schedule(plan_path: Path, confirm: bool, lead_minutes: int | None, login_lea
     plist_path.write_text(plist)
 
     release_ct = release_utc.astimezone(CENTRAL)
-    login_at_local = (release_utc - timedelta(seconds=login_lead_seconds)).astimezone()
+    entry_at_local = (release_utc - timedelta(seconds=login_lead_seconds)).astimezone()
     click.echo(f"Plist written:  {plist_path}")
     click.echo(f"Fire time:      {fire_at_local.strftime('%a %Y-%m-%d %I:%M %p %Z')} "
                f"(lead {lead_minutes} min)")
-    click.echo(f"Login at:       {login_at_local.strftime('%a %Y-%m-%d %I:%M:%S %p %Z')} "
+    click.echo(f"Site entry at:  {entry_at_local.strftime('%a %Y-%m-%d %I:%M:%S %p %Z')} "
                f"(lead {login_lead_seconds} sec)")
+    if login_lead_seconds > 60:
+        auth_at_local = (release_utc - timedelta(seconds=60)).astimezone()
+        click.echo(f"Login at:       {auth_at_local.strftime('%a %Y-%m-%d %I:%M:%S %p %Z')} "
+                   f"(deferred; keepalive idle between entry and login)")
     click.echo(f"Release moment: {release_ct.strftime('%a %Y-%m-%d %I:%M:%S %p %Z')}")
     click.echo(f"Mode:           {'REAL BOOKING (--confirm)' if confirm else 'dry-run'}")
     click.echo()
@@ -143,8 +148,10 @@ def schedule(plan_path: Path, confirm: bool, lead_minutes: int | None, login_lea
 @click.option("--dry-run", is_flag=True, help="Run full flow but stop before the binding POST.")
 @click.option("--confirm", is_flag=True, help="Required for a real booking (no-op without it).")
 @click.option("--login-lead-seconds", type=int, default=30, show_default=True,
-              help="Seconds before release to be logged in and idling. Use a large "
-                   "value (e.g. 3600) for release windows with a virtual waiting room.")
+              help="Seconds before release to start the bot's site session. "
+                   "For long leads (>60s), entry is deferred and login happens "
+                   "~60s before T=0. Use a large value (e.g. 3600) for release "
+                   "windows with a virtual waiting room.")
 def run(plan_path: Path, dry_run: bool, confirm: bool, login_lead_seconds: int) -> None:
     """Execute a booking run against a plan.
 

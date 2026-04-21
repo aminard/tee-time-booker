@@ -115,16 +115,25 @@ class Response:
 
 @dataclass
 class BookingSession:
-    """An authenticated browser session. Use as an async context manager so the
-    underlying Playwright resources are cleaned up deterministically."""
+    """A browser session for the platform. Starts unauthenticated (after
+    `enter_site()`) and is populated with auth state by `authenticate()`.
 
-    csrf_token: str
+    Use as an async context manager so the underlying Playwright resources
+    are cleaned up deterministically.
+    """
+
     base_url: str
-    user_agent: str
     _pw_mgr: Any = field(repr=False)
     _browser: Browser = field(repr=False)
     _context: BrowserContext = field(repr=False)
     _page: Page = field(repr=False)
+    # Populated by `authenticate()`. Empty until then.
+    csrf_token: str = ""
+    user_agent: str = ""
+
+    @property
+    def authenticated(self) -> bool:
+        return bool(self.csrf_token)
 
     async def __aenter__(self) -> "BookingSession":
         return self
@@ -217,6 +226,69 @@ class BookingSession:
             except Exception as e:
                 log.warning("keepalive: refresh errored", error=str(e))
 
+    async def authenticate(self, username: str, password: str) -> None:
+        """Fill the login form on the currently-displayed page and log in.
+
+        Assumes the page is already parked on splash.html (the public landing
+        page, which for anonymous users displays the login form). `enter_site()`
+        and `keepalive()` both leave the page there, so this is the common
+        state after arriving or idling through a waiting room.
+
+        Populates `self.csrf_token` and `self.user_agent` on success.
+        """
+        page = self._page
+
+        # Edge case: if the session just bounced out of a virtual waiting room,
+        # we might need a beat for the login form to render.
+        username_input = page.locator('input[name="weblogin_username"]')
+        try:
+            await username_input.wait_for(state="visible", timeout=15_000)
+        except Exception:
+            log.error(
+                "authenticate: login form did not appear",
+                url=page.url,
+                title=await page.title(),
+                body_snippet=(await page.content())[:500],
+            )
+            raise
+
+        log.info("authenticate: filling credentials")
+        await username_input.fill(username)
+        await page.fill('input[name="weblogin_password"]', password)
+
+        async with page.expect_navigation(wait_until="networkidle"):
+            await page.click(
+                'button[type="submit"], input[type="submit"], '
+                'button[name="weblogin_buttonlogin"], '
+                'input[name="weblogin_buttonlogin"]'
+            )
+
+        # If there's an active session from another browser / device, the
+        # platform interrupts with a "Login Warning - Active Session Alert"
+        # page. Clicking "Continue with Login" ends the other session and
+        # proceeds.
+        resume_button = page.locator("#loginresumesession_buttoncontinue")
+        if await resume_button.count() > 0:
+            log.info("authenticate: active session alert — taking over previous session")
+            async with page.expect_navigation(wait_until="networkidle"):
+                await resume_button.click()
+
+        final_url = page.url
+        if "_csrf_token" not in final_url:
+            raise RuntimeError(
+                f"Login did not produce a _csrf_token in the URL.\n"
+                f"  Final URL: {final_url}\n"
+                f"  Title:     {await page.title()}\n"
+            )
+
+        csrf_token = parse_qs(urlparse(final_url).query).get("_csrf_token", [""])[0]
+        if not csrf_token:
+            raise RuntimeError(f"Could not parse _csrf_token from final URL: {final_url}")
+
+        self.csrf_token = csrf_token
+        self.user_agent = await page.evaluate("navigator.userAgent")
+        log.info("authenticate: login succeeded", final_url=final_url)
+
     async def _fetch(
         self, url: str, *, body_type: str, fields: dict[str, str]
     ) -> Response:
@@ -251,14 +323,21 @@ class BookingSession:
         return Response(status=result["status"], url=result["url"], text=result["text"])
 
 
-async def login(
-    username: str, password: str, base_url: str, *, headless: bool = False
-) -> BookingSession:
-    """Log in through a real browser. Returns a BookingSession that keeps the
-    browser alive; close it (or use `async with`) when done."""
+async def enter_site(base_url: str, *, headless: bool = False) -> BookingSession:
+    """Open a browser, land on splash.html, and wait out the virtual waiting
+    room if we're redirected there. Returns an *unauthenticated* session.
+
+    Purpose: separating site entry from login lets the scheduler arrive
+    early for high-contention release windows — acquire the queue pass
+    cookie, then idle on the public splash via `keepalive()` — and defer
+    the actual login to just before the release moment. That avoids the
+    "logged-in session gets bounced through the waiting room and loses
+    state" edge case.
+
+    Close the returned session (or use `async with`) when done.
+    """
     pw_mgr = async_playwright()
     p = await pw_mgr.__aenter__()
-
     try:
         browser = await p.chromium.launch(
             headless=headless,
@@ -279,69 +358,20 @@ async def login(
         )
         page = await context.new_page()
 
-        login_landing = f"{base_url}/splash.html"
-        log.info("loading landing page", url=login_landing)
-        await page.goto(login_landing, wait_until="networkidle")
+        splash_url = f"{base_url}/splash.html"
+        log.info("enter_site: loading landing page", url=splash_url)
+        await page.goto(splash_url, wait_until="networkidle")
 
-        # During high-traffic release windows, the platform redirects all
-        # incoming traffic through a virtual waiting room. If we land there,
-        # block until the queue releases us (signed pass cookie is issued
-        # on release and the page auto-redirects back to splash).
+        # During high-traffic release windows, the platform routes traffic
+        # through a virtual waiting room. If we land there, block until
+        # released — the signed pass cookie issued on release lets
+        # subsequent navigations in this context sail through for ~24h.
         if is_in_queue(page):
-            log.warning("login: virtual waiting room detected on landing")
+            log.warning("enter_site: virtual waiting room detected on landing")
             await wait_for_queue_release(page)
 
-        username_input = page.locator('input[name="weblogin_username"]')
-        try:
-            await username_input.wait_for(state="visible", timeout=15_000)
-        except Exception:
-            log.error(
-                "login form did not appear",
-                url=page.url,
-                title=await page.title(),
-                body_snippet=(await page.content())[:500],
-            )
-            raise
-
-        log.info("filling credentials")
-        await username_input.fill(username)
-        await page.fill('input[name="weblogin_password"]', password)
-
-        async with page.expect_navigation(wait_until="networkidle"):
-            await page.click(
-                'button[type="submit"], input[type="submit"], '
-                'button[name="weblogin_buttonlogin"], '
-                'input[name="weblogin_buttonlogin"]'
-            )
-
-        # If there's an active session from another browser / device, the
-        # platform interrupts with a "Login Warning - Active Session Alert"
-        # page. Clicking "Continue with Login" ends the other session and
-        # proceeds.
-        resume_button = page.locator("#loginresumesession_buttoncontinue")
-        if await resume_button.count() > 0:
-            log.info("active session alert — taking over previous session")
-            async with page.expect_navigation(wait_until="networkidle"):
-                await resume_button.click()
-
-        final_url = page.url
-        if "_csrf_token" not in final_url:
-            raise RuntimeError(
-                f"Login did not produce a _csrf_token in the URL.\n"
-                f"  Final URL: {final_url}\n"
-                f"  Title:     {await page.title()}\n"
-            )
-
-        ua = await page.evaluate("navigator.userAgent")
-        csrf_token = parse_qs(urlparse(final_url).query).get("_csrf_token", [""])[0]
-        if not csrf_token:
-            raise RuntimeError(f"Could not parse _csrf_token from final URL: {final_url}")
-
-        log.info("login succeeded", final_url=final_url)
         return BookingSession(
-            csrf_token=csrf_token,
             base_url=base_url,
-            user_agent=ua,
             _pw_mgr=pw_mgr,
             _browser=browser,
             _context=context,
@@ -352,6 +382,25 @@ async def login(
             await pw_mgr.__aexit__(None, None, None)
         except Exception:
             pass
+        raise
+
+
+async def login(
+    username: str, password: str, base_url: str, *, headless: bool = False
+) -> BookingSession:
+    """Enter the site and authenticate in one shot. Returns a fully
+    authenticated BookingSession.
+
+    Convenience wrapper over `enter_site()` + `BookingSession.authenticate()`.
+    For release windows with a waiting room, callers that want to defer
+    login until closer to T=0 should use the two underlying steps directly.
+    """
+    session = await enter_site(base_url, headless=headless)
+    try:
+        await session.authenticate(username, password)
+        return session
+    except BaseException:
+        await session.close()
         raise
 
 
