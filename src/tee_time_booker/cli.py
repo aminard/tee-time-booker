@@ -8,6 +8,44 @@ def cli() -> None:
     """A personal tee-time reservation assistant for municipal golf courses in Austin, TX."""
 
 
+def _open_log_watcher_tabs(target_date) -> None:
+    """Pop open two Terminal.app tabs tailing this run's stdout and stderr logs.
+
+    Called at the start of `run` when `--watch-logs` is set — typically baked
+    into a launchd-armed run via `schedule --watch` so the user sees live
+    output appear the moment the bot fires, without any manual ritual.
+
+    macOS-only. Failure here must not block the booking run.
+    """
+    import subprocess
+
+    label = f"com.aminard.tee-time-booker.{target_date.isoformat()}"
+    log_path = (Path("logs") / f"{label}.log").resolve()
+    err_path = (Path("logs") / f"{label}.err.log").resolve()
+
+    # Pre-create so `tail -f` doesn't complain on missing file during first ms.
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.touch(exist_ok=True)
+    err_path.touch(exist_ok=True)
+
+    script = f'''tell application "Terminal"
+    activate
+    do script "echo '[stdout] {label}'; tail -f '{log_path}'"
+    do script "echo '[stderr] {label}'; tail -f '{err_path}'"
+end tell'''
+
+    try:
+        subprocess.run(
+            ["osascript", "-e", script],
+            check=True,
+            timeout=10,
+            capture_output=True,
+        )
+    except Exception as e:
+        # Swallow — this is a convenience, not a hard requirement.
+        click.echo(f"warning: could not open log-watcher tabs: {e}", err=True)
+
+
 @cli.command()
 def plan() -> None:
     """Interactive picker — build a plan file for an upcoming weekend."""
@@ -25,7 +63,16 @@ def plan() -> None:
                    "For long leads (>60s), the bot enters the site and idles through "
                    "any waiting room, then authenticates ~60s before opening. Use a "
                    "large value (e.g. 3600 = 60 min) for weekend opens.")
-def schedule(plan_path: Path, confirm: bool, lead_minutes: int | None, login_lead_seconds: int) -> None:
+@click.option("--watch/--no-watch", default=True, show_default=True,
+              help="When the armed run fires, auto-open Terminal tabs tailing the "
+                   "stdout and stderr logs. Only effective on macOS.")
+def schedule(
+    plan_path: Path,
+    confirm: bool,
+    lead_minutes: int | None,
+    login_lead_seconds: int,
+    watch: bool,
+) -> None:
     """Generate a launchd plist to run the bot automatically at the plan's booking-open moment.
 
     Writes a .plist into ~/Library/LaunchAgents/ that fires the bot a few
@@ -76,6 +123,7 @@ def schedule(plan_path: Path, confirm: bool, lead_minutes: int | None, login_lea
     log_path = logs_dir / f"{label}.log"
     err_path = logs_dir / f"{label}.err.log"
 
+    watch_arg = "\n        <string>--watch-logs</string>" if watch else ""
     plist = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -91,7 +139,7 @@ def schedule(plan_path: Path, confirm: bool, lead_minutes: int | None, login_lea
         <string>tee-time-booker</string>
         <string>run</string>
         <string>--login-lead-seconds</string>
-        <string>{login_lead_seconds}</string>
+        <string>{login_lead_seconds}</string>{watch_arg}
         <string>{flag}</string>
         <string>{plan_abs}</string>
     </array>
@@ -152,7 +200,17 @@ def schedule(plan_path: Path, confirm: bool, lead_minutes: int | None, login_lea
                    "For long leads (>60s), login is deferred and fires "
                    "~60s before T=0. Use a large value (e.g. 3600) for opens "
                    "that route through a virtual waiting room.")
-def run(plan_path: Path, dry_run: bool, confirm: bool, login_lead_seconds: int) -> None:
+@click.option("--watch-logs", is_flag=True,
+              help="Open Terminal tabs tailing stdout/stderr as soon as this run "
+                   "starts. Intended to be baked into launchd-armed runs via "
+                   "`schedule --watch` so the user sees live output automatically.")
+def run(
+    plan_path: Path,
+    dry_run: bool,
+    confirm: bool,
+    login_lead_seconds: int,
+    watch_logs: bool,
+) -> None:
     """Execute a booking run against a plan.
 
     Waits until the plan's booking-open moment (NTP-synced) before firing.
@@ -184,6 +242,9 @@ def run(plan_path: Path, dry_run: bool, confirm: bool, login_lead_seconds: int) 
     load_dotenv()
     secrets = Secrets()  # type: ignore[call-arg]
     plan = load_plan(plan_path)
+
+    if watch_logs:
+        _open_log_watcher_tabs(plan.target_date)
 
     logs_dir = Path("logs")
     logs_dir.mkdir(exist_ok=True)
