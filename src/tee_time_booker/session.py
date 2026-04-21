@@ -6,11 +6,12 @@ Using the page navigation stack — rather than Playwright's separate
 `context.request` API — is what actually shares TLS + cookies + any
 additional state the server expects from a real browser.
 
-Some release windows run behind a virtual waiting room. When the platform
-redirects us to it, we wait for the queue to release us automatically
-(detected via URL leaving the queue host). Once released, a signed pass
-cookie is set on the platform domain and persists for ~24 hours, so
-subsequent navigations in the same browser context sail through.
+Some booking-open windows run behind a virtual waiting room. When the
+platform redirects us to it, we wait for the queue to release us
+automatically (detected via URL leaving the queue host). Once released,
+a signed pass cookie is set on the platform domain and persists for
+~24 hours, so subsequent navigations in the same browser context sail
+through.
 """
 
 import asyncio
@@ -38,7 +39,7 @@ def is_in_queue(page: Page) -> bool:
 
 
 async def has_queue_pass(context: BrowserContext, target_date: ddate) -> bool:
-    """True if the context holds a signed pass cookie for this release event.
+    """True if the context holds a signed pass cookie for the booking-open event.
 
     The pass is issued by the waiting room and set on the platform domain
     when it releases us. Name format observed: `QueueITAccepted-*_txaustin{YYYYMMDD}`.
@@ -66,11 +67,12 @@ async def wait_for_queue_release(
 
     The 4 h default timeout is deliberately loose. The right frame isn't
     "how long am I willing to sit in the queue" but "how long past the
-    release moment am I willing to keep trying to book." Arriving hours
-    early for data-gathering + being willing to wait ~1-2 h past release
-    (slots can linger) adds up to ~4 h. The 24 h queue-pass cookie means
-    once through, subsequent navigations are cheap. Better to try and
-    fail on stale slots than to give up before the queue even clears.
+    booking-open moment am I willing to keep trying to book." Arriving
+    hours early for data-gathering + being willing to wait ~1-2 h past
+    opening (slots can linger) adds up to ~4 h. The 24 h queue-pass
+    cookie means once through, subsequent navigations are cheap. Better
+    to try and fail on stale slots than to give up before the queue
+    even clears.
     """
     loop = asyncio.get_event_loop()
     start = loop.time()
@@ -336,9 +338,9 @@ async def enter_site(base_url: str, *, headless: bool = False) -> BookingSession
     room if we're redirected there. Returns an *unauthenticated* session.
 
     Purpose: separating site entry from login lets the scheduler arrive
-    early for high-contention release windows — acquire the queue pass
-    cookie, then idle on the public splash via `keepalive()` — and defer
-    the actual login to just before the release moment. That avoids the
+    early for high-contention booking-open windows — acquire the queue
+    pass cookie, then idle on the public splash via `keepalive()` — and
+    defer the actual login to just before booking opens. That avoids the
     "logged-in session gets bounced through the waiting room and loses
     state" edge case.
 
@@ -370,9 +372,9 @@ async def enter_site(base_url: str, *, headless: bool = False) -> BookingSession
         log.info("enter_site: loading landing page", url=splash_url)
         await page.goto(splash_url, wait_until="networkidle")
 
-        # During high-traffic release windows, the platform routes traffic
-        # through a virtual waiting room. If we land there, block until
-        # released — the signed pass cookie issued on release lets
+        # During high-traffic booking-open windows, the platform routes
+        # traffic through a virtual waiting room. If we land there, block
+        # until released — the signed pass cookie issued on release lets
         # subsequent navigations in this context sail through for ~24h.
         if is_in_queue(page):
             log.warning("enter_site: virtual waiting room detected on landing")
@@ -400,8 +402,9 @@ async def login(
     authenticated BookingSession.
 
     Convenience wrapper over `enter_site()` + `BookingSession.authenticate()`.
-    For release windows with a waiting room, callers that want to defer
-    login until closer to T=0 should use the two underlying steps directly.
+    For booking-open windows with a waiting room, callers that want to
+    defer login until closer to T=0 should use the two underlying steps
+    directly.
     """
     session = await enter_site(base_url, headless=headless)
     try:
@@ -494,18 +497,18 @@ async def _smoke_test_keepalive() -> None:
 
 
 async def _smoke_test_scheduled() -> None:
-    """Rehearse the long-lead scheduled-run timeline with a fake release
-    moment. Exits after 'release' instead of booking.
+    """Rehearse the long-lead scheduled-run timeline with a fake booking-open
+    moment. Exits after 'fake opens' instead of booking.
 
     Env vars (all seconds):
-      LEAD_SEC (default 360)     — total lead from now to fake release
-      AUTH_LEAD_SEC (default 60) — login happens this far before fake release
+      LEAD_SEC (default 360)     — total lead from now to fake opens
+      AUTH_LEAD_SEC (default 60) — login happens this far before fake opens
       KEEPALIVE_INTERVAL_SEC (default 45) — shortened from prod's 90 so we
                                             see multiple cycles in a 6-min run
 
     Expected sequence:
       enter_site (~few s) → keepalive loop (≥1 cycle) → authenticate (~few s)
-      → quiet wait → 'fake release hit' log → exit 0
+      → quiet wait → 'fake opens hit' log → exit 0
     """
     import os
 
@@ -523,22 +526,22 @@ async def _smoke_test_scheduled() -> None:
     headless = os.getenv("HEADLESS", "0") == "1"
 
     clock = await sync_clock()
-    release = clock.now_utc() + timedelta(seconds=lead_sec)
+    opens_at = clock.now_utc() + timedelta(seconds=lead_sec)
 
     log.info(
         "smoke scheduled: starting",
-        fake_release_utc=release.isoformat(),
+        fake_opens_at_utc=opens_at.isoformat(),
         lead_sec=lead_sec,
         auth_lead_sec=auth_lead_sec,
         keepalive_interval=keepalive_interval,
     )
-    print(f"\nFake release moment: {release.isoformat(timespec='seconds')}")
+    print(f"\nFake booking-open moment: {opens_at.isoformat(timespec='seconds')}")
     print(f"  Lead total:         {lead_sec}s")
     print(f"  Auth lead:          {auth_lead_sec}s (login at fake T-{auth_lead_sec}s)")
     print(f"  Keepalive interval: {keepalive_interval}s\n")
 
     async with await enter_site(secrets.base_url, headless=headless) as session:
-        auth_at = release - timedelta(seconds=auth_lead_sec)
+        auth_at = opens_at - timedelta(seconds=auth_lead_sec)
         now = clock.now_utc()
         if now < auth_at and (auth_at - now).total_seconds() > keepalive_interval:
             wait_s = (auth_at - now).total_seconds()
@@ -559,14 +562,14 @@ async def _smoke_test_scheduled() -> None:
             secrets.username, secrets.password.get_secret_value()
         )
 
-        wait_s = (release - clock.now_utc()).total_seconds()
+        wait_s = (opens_at - clock.now_utc()).total_seconds()
         log.info(
-            "logged in; waiting for fake release moment",
+            "logged in; waiting for fake opens moment",
             wait_seconds=round(wait_s, 3),
         )
-        await clock.sleep_until(release)
+        await clock.sleep_until(opens_at)
 
-        log.warning("fake release hit; WOULD fire booking now (smoke exits here)")
+        log.warning("fake opens hit; WOULD fire booking now (smoke exits here)")
         print("\n✓ Timeline rehearsal complete — all phases fired in order.")
 
 

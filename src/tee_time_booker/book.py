@@ -433,7 +433,7 @@ async def run_booking(session: BookingSession, plan, secrets, *, dry_run: bool =
 
 
 # ---------------------------------------------------------------------------
-# Scheduled (release-moment-aware) entry point
+# Scheduled (booking-open-aware) entry point
 # ---------------------------------------------------------------------------
 
 
@@ -444,14 +444,14 @@ async def run_scheduled_booking(
     dry_run: bool = True,
     lead_time_sec: int = 30,
     headless: bool = False,
-    post_release_jitter_ms: tuple[int, int] = (50, 300),
+    post_open_jitter_ms: tuple[int, int] = (50, 300),
     keepalive_interval_sec: int = 90,
     auth_lead_sec: int = 60,
     final_quiet_sec: int = 5,
 ) -> BookingResult:
-    """Run a booking, waiting until the plan's release moment before firing.
+    """Run a booking, waiting until the moment booking opens before firing.
 
-    Timeline (for long lead windows — release routes through a waiting room):
+    Timeline (for long lead windows — traffic may route through a waiting room):
       1. Sync clock against NTP (~200 ms)
       2. Sleep until T - lead_time_sec
       3. Enter site (wait out waiting room if present) — acquires the 24h
@@ -460,10 +460,10 @@ async def run_scheduled_booking(
          keepalive_interval_sec)
       5. Authenticate at T - auth_lead_sec
       6. Quiet sleep until T - final_quiet_sec, then tight wait to T = 0
-      7. Post-release jitter (default 50-300 ms)
+      7. Post-open jitter (default 50-300 ms)
       8. Fire the booking pipeline
 
-    For short lead windows (weekday releases with no waiting room, default
+    For short lead windows (weekday opens with no waiting room, default
     lead_time_sec=30), steps 3-5 collapse into a single combined login
     (equivalent to the previous behavior).
 
@@ -471,30 +471,30 @@ async def run_scheduled_booking(
     in at T-60min and sitting idle for an hour — avoids an edge case where
     a mid-session redirect through the waiting room invalidates the auth
     session. Only the queue pass cookie needs to persist through the wait,
-    and that's a 24h signed token scoped to the release date.
+    and that's a 24h signed token scoped to the target date.
 
-    If the release moment has already passed, fires immediately.
+    If booking has already opened, fires immediately.
     """
-    from tee_time_booker.clock import compute_release_moment, sync_clock
+    from tee_time_booker.clock import compute_booking_opens_at, sync_clock
     from tee_time_booker.session import enter_site, login
 
-    release = compute_release_moment(plan.target_date)
+    opens_at = compute_booking_opens_at(plan.target_date)
     clock = await sync_clock()
     now = clock.now_utc()
 
     log.info(
         "scheduled run",
         target_date=plan.target_date.isoformat(),
-        release_utc=release.isoformat(),
+        opens_at_utc=opens_at.isoformat(),
         now_utc=now.isoformat(),
         offset_ms=clock.offset_seconds * 1000,
         lead_time_sec=lead_time_sec,
     )
 
-    if now >= release:
+    if now >= opens_at:
         log.warning(
-            "release moment has already passed, firing immediately",
-            past_by_seconds=(now - release).total_seconds(),
+            "booking has already opened, firing immediately",
+            past_by_seconds=(now - opens_at).total_seconds(),
         )
         async with await login(
             secrets.username,
@@ -504,7 +504,7 @@ async def run_scheduled_booking(
         ) as session:
             return await run_booking(session, plan, secrets, dry_run=dry_run)
 
-    enter_at = release - timedelta(seconds=lead_time_sec)
+    enter_at = opens_at - timedelta(seconds=lead_time_sec)
     now = clock.now_utc()
     if now < enter_at:
         wait_s = (enter_at - now).total_seconds()
@@ -521,16 +521,16 @@ async def run_scheduled_booking(
             headless=headless,
         ) as session:
             return await _wait_and_book(
-                session, plan, secrets, clock, release,
-                post_release_jitter_ms=post_release_jitter_ms,
+                session, plan, secrets, clock, opens_at,
+                post_open_jitter_ms=post_open_jitter_ms,
                 final_quiet_sec=final_quiet_sec,
                 dry_run=dry_run,
             )
 
     # Long-lead path: enter site unauthenticated, keepalive, then authenticate
-    # just before release.
+    # just before booking opens.
     async with await enter_site(secrets.base_url, headless=headless) as session:
-        auth_at = release - timedelta(seconds=auth_lead_sec)
+        auth_at = opens_at - timedelta(seconds=auth_lead_sec)
         now = clock.now_utc()
         if now < auth_at and (auth_at - now).total_seconds() > keepalive_interval_sec:
             wait_s = (auth_at - now).total_seconds()
@@ -554,8 +554,8 @@ async def run_scheduled_booking(
         )
 
         return await _wait_and_book(
-            session, plan, secrets, clock, release,
-            post_release_jitter_ms=post_release_jitter_ms,
+            session, plan, secrets, clock, opens_at,
+            post_open_jitter_ms=post_open_jitter_ms,
             final_quiet_sec=final_quiet_sec,
             dry_run=dry_run,
         )
@@ -566,19 +566,19 @@ async def _wait_and_book(
     plan,
     secrets,
     clock,
-    release,
+    opens_at,
     *,
-    post_release_jitter_ms: tuple[int, int],
+    post_open_jitter_ms: tuple[int, int],
     final_quiet_sec: int,
     dry_run: bool,
 ) -> BookingResult:
-    """Quiet wait to release, jitter, then fire the booking pipeline."""
-    wait_s = (release - clock.now_utc()).total_seconds()
-    log.info("waiting for release moment", wait_seconds=round(wait_s, 3))
-    await clock.sleep_until(release)
+    """Quiet wait until booking opens, jitter, then fire the booking pipeline."""
+    wait_s = (opens_at - clock.now_utc()).total_seconds()
+    log.info("waiting until booking opens", wait_seconds=round(wait_s, 3))
+    await clock.sleep_until(opens_at)
 
-    jitter_ms = random.randint(*post_release_jitter_ms)
-    log.info("release hit; jittering before firing", jitter_ms=jitter_ms)
+    jitter_ms = random.randint(*post_open_jitter_ms)
+    log.info("booking open; jittering before firing", jitter_ms=jitter_ms)
     await asyncio.sleep(jitter_ms / 1000)
 
     return await run_booking(session, plan, secrets, dry_run=dry_run)

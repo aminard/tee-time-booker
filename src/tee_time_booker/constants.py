@@ -2,8 +2,8 @@ from zoneinfo import ZoneInfo
 
 CENTRAL = ZoneInfo("America/Chicago")
 
-WEEKEND_RELEASE_HOUR = 20
-WEEKDAY_RELEASE_HOUR = 9
+WEEKEND_OPEN_HOUR = 20
+WEEKDAY_OPEN_HOUR = 9
 WEEKDAY_ADVANCE_DAYS = 7
 
 COURSES: dict[str, str] = {

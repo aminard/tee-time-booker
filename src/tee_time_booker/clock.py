@@ -1,4 +1,4 @@
-"""NTP-synced clock for precise release-moment scheduling.
+"""NTP-synced clock for precise booking-moment scheduling.
 
 Local system clocks drift. For a scheduled run that must fire within
 milliseconds of a known instant, we sync against an NTP server once at
@@ -17,8 +17,8 @@ import structlog
 from tee_time_booker.constants import (
     CENTRAL,
     WEEKDAY_ADVANCE_DAYS,
-    WEEKDAY_RELEASE_HOUR,
-    WEEKEND_RELEASE_HOUR,
+    WEEKDAY_OPEN_HOUR,
+    WEEKEND_OPEN_HOUR,
 )
 
 log = structlog.get_logger()
@@ -89,12 +89,17 @@ async def sync_clock(server: str = DEFAULT_NTP_SERVER, *, attempts: int = 3) -> 
     raise RuntimeError(f"NTP sync failed after {attempts} attempts: {last_error}")
 
 
-def compute_release_moment(target_date: date) -> datetime:
-    """Return the UTC datetime at which slots for `target_date` are released.
+def compute_booking_opens_at(target_date: date) -> datetime:
+    """Return the UTC datetime at which the Add-to-Cart endpoint starts
+    accepting claims for `target_date`.
 
-    Release rules (Austin muni, but encoded here as the app's business logic):
-      - Sat/Sun targets release on the preceding Monday at 8:00 PM Central.
-      - Mon-Thu targets release 7 days in advance at 9:00 AM Central.
+    (The tee-time rows are always visible in the UI — what actually changes
+    at this moment is that the Add-to-Cart button activates and the server
+    starts accepting claim requests.)
+
+    Rules (Austin muni, encoded here as the app's business logic):
+      - Sat/Sun targets open on the preceding Monday at 8:00 PM Central.
+      - Mon-Thu targets open 7 days in advance at 9:00 AM Central.
       - Fri targets: not formally documented by the platform; assume
         weekday rules (7 days in advance at 9 AM Central).
     """
@@ -103,19 +108,19 @@ def compute_release_moment(target_date: date) -> datetime:
     if weekday >= 5:  # Saturday or Sunday
         monday = target_date - timedelta(days=weekday)
         wall_clock = datetime.combine(
-            monday, dtime(WEEKEND_RELEASE_HOUR, 0), tzinfo=CENTRAL
+            monday, dtime(WEEKEND_OPEN_HOUR, 0), tzinfo=CENTRAL
         )
     else:
-        release_date = target_date - timedelta(days=WEEKDAY_ADVANCE_DAYS)
+        open_date = target_date - timedelta(days=WEEKDAY_ADVANCE_DAYS)
         wall_clock = datetime.combine(
-            release_date, dtime(WEEKDAY_RELEASE_HOUR, 0), tzinfo=CENTRAL
+            open_date, dtime(WEEKDAY_OPEN_HOUR, 0), tzinfo=CENTRAL
         )
 
     return wall_clock.astimezone(timezone.utc)
 
 
 async def _smoke_test() -> None:
-    """Sync clock, report offset, demonstrate sleep_until precision, show release moments."""
+    """Sync clock, report offset, demonstrate sleep_until precision, show booking-open moments."""
     clock = await sync_clock()
 
     print(f"\nClock synced against {clock.ntp_server}")
@@ -138,8 +143,8 @@ async def _smoke_test() -> None:
         ("Wednesday", date(2026, 5, 6)),
         ("Friday", date(2026, 5, 8)),
     ]:
-        rel = compute_release_moment(d)
-        print(f"\nTarget {d.isoformat()} ({label}) releases at:")
+        rel = compute_booking_opens_at(d)
+        print(f"\nTarget {d.isoformat()} ({label}) booking opens at:")
         print(f"  UTC:      {rel.isoformat(timespec='seconds')}")
         print(f"  Central:  {rel.astimezone(CENTRAL).isoformat(timespec='seconds')}")
 
