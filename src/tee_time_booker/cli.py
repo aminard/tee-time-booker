@@ -329,7 +329,7 @@ def run(
     import structlog
     from dotenv import load_dotenv
 
-    from tee_time_booker.book import run_scheduled_booking
+    from tee_time_booker.book import BookingRunError, run_scheduled_booking
     from tee_time_booker.config import Secrets, load_plan
     from tee_time_booker.constants import CENTRAL
 
@@ -365,12 +365,22 @@ def run(
                 keep_browser_open_sec=keep_browser_open_sec,
             )
         )
+    except BookingRunError as e:
+        # Bot ran but failed inside the pipeline; e.partial_result has the
+        # diagnostic context populated before the browser closed.
+        result = e.partial_result
+        error = e.__cause__ or e
+        error_traceback = traceback.format_exception(type(error), error, error.__traceback__)
+        error_traceback = "".join(error_traceback)
     except Exception as e:
+        # Unexpected error before/after the pipeline (e.g. NTP failure, config
+        # error, browser launch failure). No partial_result available.
         error = e
         error_traceback = traceback.format_exc()
     finished_at = datetime.now(tz=CENTRAL)
 
     summary = {
+        # Identity & timing
         "run_id": run_id,
         "started_at": started_at.isoformat(timespec="seconds"),
         "finished_at": finished_at.isoformat(timespec="seconds"),
@@ -379,6 +389,8 @@ def run(
         "plan_path": str(plan_path),
         "mode": "real" if confirm else "dry_run",
         "success": error is None,
+
+        # Pipeline progress
         "steps_completed": result.steps_completed if result else [],
         "slot": (
             {
@@ -390,11 +402,68 @@ def run(
             else None
         ),
         "confirmation_url": result.confirmation_url if result else None,
+
+        # Search context
+        "slots_total_found": result.slots_total_found if result else None,
+        "slots_in_window": result.slots_in_window if result else None,
+        "ranked_top": (
+            [{"course": c, "time": t} for c, t in result.ranked_top]
+            if result and result.ranked_top
+            else []
+        ),
+
+        # Queue context
+        "queue_encountered": result.queue_encountered if result else False,
+        "queue_wait_sec": result.queue_wait_sec if result else None,
+        "queue_id": result.queue_id if result else None,
+        "queue_headline_at_release": result.queue_headline_at_release if result else None,
+
+        # Failure context
+        "failed_step": result.failed_step if result else None,
+        "failed_url": result.failed_url if result else None,
+        "failed_page_title": result.failed_page_title if result else None,
+
+        # Timing breakdown
+        "time_in_keepalive_sec": result.time_in_keepalive_sec if result else None,
+        "time_in_pipeline_sec": result.time_in_pipeline_sec if result else None,
+
+        # Error
         "error": str(error) if error else None,
         "error_type": type(error).__name__ if error else None,
         "error_traceback": error_traceback,
     }
     result_path.write_text(json.dumps(summary, indent=2, default=str))
+
+    # Append a one-line entry to the registry for chronological history
+    # scanning (e.g. `tail logs/index.jsonl | jq`).
+    registry_path = logs_dir / "index.jsonl"
+    registry_entry = {
+        k: summary[k]
+        for k in (
+            "run_id",
+            "started_at",
+            "finished_at",
+            "duration_seconds",
+            "target_date",
+            "mode",
+            "success",
+            "steps_completed",
+            "slot",
+            "confirmation_url",
+            "slots_total_found",
+            "slots_in_window",
+            "queue_encountered",
+            "queue_wait_sec",
+            "failed_step",
+            "failed_url",
+            "time_in_keepalive_sec",
+            "time_in_pipeline_sec",
+            "error",
+            "error_type",
+        )
+    }
+    with registry_path.open("a") as f:
+        f.write(json.dumps(registry_entry, default=str) + "\n")
 
     click.echo()
     if error is None:
@@ -407,13 +476,23 @@ def run(
             )
         if result.confirmation_url:
             click.echo(f"Confirmation URL: {result.confirmation_url}")
+        if result.queue_encountered:
+            click.echo(f"Queue: waited {result.queue_wait_sec}s")
     else:
         click.secho(f"=== FAILED: {type(error).__name__}: {error} ===", fg="red")
         if result and result.steps_completed:
             click.echo(f"Steps completed before failure: {' → '.join(result.steps_completed)}")
+        if result and result.failed_step:
+            click.echo(f"Failed step:    {result.failed_step}")
+        if result and result.failed_url:
+            click.echo(f"Failed URL:     {result.failed_url}")
+            click.echo(f"Failed title:   {result.failed_page_title or '?'}")
+        if result and result.queue_encountered:
+            click.echo(f"Queue:          waited {result.queue_wait_sec}s")
 
     click.echo()
     click.echo(f"Result summary: {result_path.resolve()}")
+    click.echo(f"Registry:       {registry_path.resolve()}")
 
     if error is not None:
         raise error

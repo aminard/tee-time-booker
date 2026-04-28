@@ -82,6 +82,25 @@ class CheckoutForm:
     csrf_token: str
 
 
+class BookingRunError(Exception):
+    """Wraps any exception raised during a booking run, attaching the
+    partial BookingResult so the caller can serialize failure diagnostics
+    (failed_step, failed_url, queue stats, etc.) the same way it does for
+    successful runs.
+
+    Usage in callers:
+        try:
+            result = await run_scheduled_booking(...)
+        except BookingRunError as e:
+            result = e.partial_result   # has full diagnostic context
+            error = e.__cause__         # the original exception
+    """
+
+    def __init__(self, message: str, partial_result: "BookingResult"):
+        super().__init__(message)
+        self.partial_result = partial_result
+
+
 @dataclass
 class BookingResult:
     slot: TeeTimeSlot | None = None
@@ -89,6 +108,31 @@ class BookingResult:
     steps_completed: list[str] = field(default_factory=list)
     checkout_form: CheckoutForm | None = None
     confirmation_url: str | None = None
+
+    # --- Diagnostic context (populated as the run progresses) ---
+    # Search context — counts before / after time-window filter, and the top of
+    # the ranked list. Useful for understanding why a booking did/didn't
+    # find what it wanted.
+    slots_total_found: int | None = None
+    slots_in_window: int | None = None
+    ranked_top: list[tuple[str, str]] = field(default_factory=list)  # [(course, "12:00 PM"), ...]
+
+    # Queue context — populated by wait_for_queue_release (whether triggered
+    # from enter_site or mid-keepalive). None if the run never touched the queue.
+    queue_encountered: bool = False
+    queue_wait_sec: float | None = None
+    queue_id: str | None = None
+    queue_headline_at_release: str | None = None
+
+    # Failure context — populated only on exception, captured before the
+    # browser context closes so we know the bot's last-known state.
+    failed_step: str | None = None
+    failed_url: str | None = None
+    failed_page_title: str | None = None
+
+    # Timing breakdown — split out so we can see where the time went.
+    time_in_keepalive_sec: float | None = None
+    time_in_pipeline_sec: float | None = None
 
 
 def _course_slug(display_name: str) -> str:
@@ -347,16 +391,27 @@ async def finalize_booking(
     return resp.url
 
 
-async def run_booking(session: BookingSession, plan, secrets, *, dry_run: bool = True) -> BookingResult:
+async def run_booking(
+    session: BookingSession,
+    plan,
+    secrets,
+    *,
+    dry_run: bool = True,
+    result: BookingResult | None = None,
+) -> BookingResult:
     """Full pipeline. Stops before the binding POST when `dry_run=True`.
 
     Non-binding steps retry with exponential backoff on transient failures.
     The finalize POST is never retried — the server may have committed even
     on a "failed" response, and a retry would risk a double-booking.
-    """
-    result = BookingResult(dry_run=dry_run)
 
-    slots, csrf = await with_retry(
+    A pre-existing `result` may be passed in (lets the caller pre-populate
+    diagnostic context like timing). Otherwise a fresh one is created.
+    """
+    if result is None:
+        result = BookingResult(dry_run=dry_run)
+
+    slots, total_found, csrf = await with_retry(
         lambda: search(
             session,
             target_date=plan.target_date,
@@ -368,16 +423,19 @@ async def run_booking(session: BookingSession, plan, secrets, *, dry_run: bool =
         label="search",
     )
     result.steps_completed.append("search")
+    result.slots_total_found = total_found
+    result.slots_in_window = len(slots)
     if not slots:
         raise RuntimeError("run_booking: no slots in window")
 
     ranked = rank_slots(slots, plan.courses_ranked())
+    result.ranked_top = [(s.course, s.tee_time.strftime("%I:%M %p")) for s in ranked[:5]]
     if not ranked:
         raise RuntimeError("run_booking: no slots match preferred courses")
     log.info(
         "run_booking: ranked candidates",
         count=len(ranked),
-        top=[(s.course, s.tee_time.strftime("%I:%M %p")) for s in ranked[:5]],
+        top=result.ranked_top,
     )
 
     # Try slots in preference order. First one whose claim lands a player-
@@ -491,6 +549,8 @@ async def run_scheduled_booking(
         lead_time_sec=lead_time_sec,
     )
 
+    result = BookingResult(dry_run=dry_run)
+
     if now >= opens_at:
         log.warning(
             "booking has already opened, firing immediately",
@@ -502,7 +562,9 @@ async def run_scheduled_booking(
             secrets.base_url,
             headless=headless,
         ) as session:
-            result = await run_booking(session, plan, secrets, dry_run=dry_run)
+            result = await _run_booking_with_diagnostics(
+                session, plan, secrets, dry_run=dry_run, result=result,
+            )
             await _linger(keep_browser_open_sec)
             return result
 
@@ -527,13 +589,16 @@ async def run_scheduled_booking(
                 final_quiet_sec=final_quiet_sec,
                 dry_run=dry_run,
                 keep_browser_open_sec=keep_browser_open_sec,
+                result=result,
             )
 
     # Long-lead path: enter site unauthenticated, keepalive, then authenticate
     # just before booking opens.
+    import time as _time
     async with await enter_site(secrets.base_url, headless=headless) as session:
         auth_at = opens_at - timedelta(seconds=auth_lead_sec)
         now = clock.now_utc()
+        t_keepalive_start = _time.monotonic()
         if now < auth_at and (auth_at - now).total_seconds() > keepalive_interval_sec:
             wait_s = (auth_at - now).total_seconds()
             log.info(
@@ -548,6 +613,7 @@ async def run_scheduled_booking(
                 fast_interval_sec=keepalive_fast_interval_sec,
                 fast_duration_sec=keepalive_fast_duration_sec,
             )
+        result.time_in_keepalive_sec = round(_time.monotonic() - t_keepalive_start, 1)
 
         # Authenticate.
         remaining = (auth_at - clock.now_utc()).total_seconds()
@@ -563,6 +629,7 @@ async def run_scheduled_booking(
             final_quiet_sec=final_quiet_sec,
             dry_run=dry_run,
             keep_browser_open_sec=keep_browser_open_sec,
+            result=result,
         )
 
 
@@ -576,6 +643,7 @@ async def _wait_and_book(
     final_quiet_sec: int,
     dry_run: bool,
     keep_browser_open_sec: int = 0,
+    result: BookingResult | None = None,
 ) -> BookingResult:
     """Quiet wait until booking opens, then fire the booking pipeline."""
     wait_s = (opens_at - clock.now_utc()).total_seconds()
@@ -583,9 +651,71 @@ async def _wait_and_book(
     await clock.sleep_until(opens_at)
 
     log.info("booking open; firing pipeline")
-    result = await run_booking(session, plan, secrets, dry_run=dry_run)
+    result = await _run_booking_with_diagnostics(
+        session, plan, secrets, dry_run=dry_run, result=result,
+    )
     await _linger(keep_browser_open_sec)
     return result
+
+
+async def _run_booking_with_diagnostics(
+    session,
+    plan,
+    secrets,
+    *,
+    dry_run: bool,
+    result: BookingResult | None = None,
+) -> BookingResult:
+    """Run the booking pipeline, decorating the result with diagnostic context
+    on both success and failure.
+
+    Must be called inside the BookingSession's `async with` so that on failure
+    we can read `session._page` (URL + title) before the browser closes.
+
+    On any internal exception, wraps it as `BookingRunError` carrying the
+    partial result — caller can introspect `e.partial_result` for full
+    failure context (failed_step, failed_url, queue stats, etc.).
+    """
+    import time
+
+    if result is None:
+        result = BookingResult(dry_run=dry_run)
+
+    t_start = time.monotonic()
+    try:
+        await run_booking(session, plan, secrets, dry_run=dry_run, result=result)
+    except Exception as e:
+        # Capture failure context BEFORE the BookingSession context closes
+        # the browser. Once we re-raise, the browser is gone.
+        result.failed_step = (
+            result.steps_completed[-1] if result.steps_completed else "before search"
+        )
+        try:
+            result.failed_url = session._page.url
+            result.failed_page_title = await session._page.title()
+        except Exception:
+            # Browser may already be in a bad state; don't mask the original error.
+            pass
+        # Promote queue stats + timing onto the result so they're available
+        # to the caller via e.partial_result.
+        _promote_session_diagnostics(session, result, t_start)
+        raise BookingRunError(str(e), result) from e
+
+    _promote_session_diagnostics(session, result, t_start)
+    return result
+
+
+def _promote_session_diagnostics(session, result: BookingResult, t_start: float) -> None:
+    """Copy queue stats from the session and pipeline timing onto the result.
+    Idempotent — safe to call from both success and failure paths."""
+    import time
+
+    result.time_in_pipeline_sec = round(time.monotonic() - t_start, 1)
+    if session.queue_stats:
+        result.queue_encountered = True
+        result.queue_wait_sec = session.queue_stats.get("wait_sec")
+        result.queue_id = session.queue_stats.get("queue_id")
+        result.queue_headline_at_release = session.queue_stats.get("headline_at_release")
 
 
 async def _linger(seconds: int) -> None:

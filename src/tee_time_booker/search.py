@@ -67,11 +67,13 @@ async def search(
     num_players: int,
     num_holes: int,
     debug_dump: Path | None = None,
-) -> tuple[list[TeeTimeSlot], str]:
-    """Fetch + parse search results. Returns (slots, fresh_csrf_token).
+) -> tuple[list[TeeTimeSlot], int, str]:
+    """Fetch + parse search results.
 
-    Filters client-side to slots whose tee_time is <= latest_time.
-    The returned csrf_token is scraped from the response (may have rotated).
+    Returns (slots_in_window, total_found, fresh_csrf_token):
+      - slots_in_window: parsed slots whose tee_time is <= latest_time
+      - total_found:    parsed slots before the time-window filter (diagnostic)
+      - fresh_csrf:     csrf_token scraped from the response (may have rotated)
     """
     url = build_search_url(
         session.base_url,
@@ -101,7 +103,7 @@ async def search(
         in_time_window=len(in_window),
         fresh_csrf_differs=(fresh_csrf != session.csrf_token),
     )
-    return in_window, fresh_csrf
+    return in_window, len(all_slots), fresh_csrf
 
 
 def _parse_results(
@@ -233,7 +235,7 @@ async def _smoke_test() -> None:
         secrets.password.get_secret_value(),
         secrets.base_url,
     ) as sess:
-        slots, fresh_csrf = await search(
+        slots, total_found, fresh_csrf = await search(
             sess,
             target_date=plan.target_date,
             earliest_time=plan.earliest_time,

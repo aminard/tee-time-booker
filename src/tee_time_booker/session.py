@@ -94,7 +94,7 @@ async def wait_for_queue_release(
     poll_interval_sec: float = 2.0,
     log_interval_sec: float = 30.0,
     timeout_sec: int = 14400,
-) -> None:
+) -> dict:
     """Block until the page navigates out of the virtual waiting room.
 
     The waiting room JS polls its own status endpoint and triggers a full
@@ -116,6 +116,7 @@ async def wait_for_queue_release(
     start = loop.time()
     last_log = start
     initial_meta = await _scrape_queue_metadata(page)
+    last_meta = initial_meta
     log.warning(
         "virtual waiting room: entered",
         url=page.url,
@@ -124,16 +125,22 @@ async def wait_for_queue_release(
     )
     while True:
         if not is_in_queue(page):
+            wait_seconds = round(loop.time() - start, 1)
             log.info(
                 "virtual waiting room: released",
-                wait_seconds=round(loop.time() - start, 1),
+                wait_seconds=wait_seconds,
                 url=page.url,
             )
             try:
                 await page.wait_for_load_state("networkidle", timeout=15_000)
             except Exception:
                 pass
-            return
+            return {
+                "wait_sec": wait_seconds,
+                "queue_id": last_meta.get("queue_id") or initial_meta.get("queue_id"),
+                "headline_at_release": last_meta.get("headline"),
+                "headline_at_entry": initial_meta.get("headline"),
+            }
 
         elapsed = loop.time() - start
         if elapsed >= timeout_sec:
@@ -141,12 +148,12 @@ async def wait_for_queue_release(
                 f"virtual waiting room: timed out after {timeout_sec}s (still on {page.url})"
             )
         if loop.time() - last_log >= log_interval_sec:
-            meta = await _scrape_queue_metadata(page)
+            last_meta = await _scrape_queue_metadata(page)
             log.info(
                 "virtual waiting room: still waiting",
                 wait_seconds=round(elapsed, 1),
                 url=page.url,
-                **meta,
+                **last_meta,
             )
             last_log = loop.time()
         await asyncio.sleep(poll_interval_sec)
@@ -182,6 +189,9 @@ class BookingSession:
     # Populated by `authenticate()`. Empty until then.
     csrf_token: str = ""
     user_agent: str = ""
+    # Populated by enter_site() or keepalive() if we ever pass through the
+    # virtual waiting room. None means we never hit the queue this run.
+    queue_stats: dict | None = None
 
     @property
     def authenticated(self) -> bool:
@@ -278,7 +288,11 @@ class BookingSession:
                     log.warning(
                         "keepalive: virtual waiting room encountered mid-session"
                     )
-                    await wait_for_queue_release(self._page)
+                    stats = await wait_for_queue_release(self._page)
+                    # Stash stats so the caller can promote them to BookingResult.
+                    # If we already have stats from an earlier queue pass this
+                    # run (rare), keep the latest.
+                    self.queue_stats = stats
                     # Queue may have bounced us to a logged-out state. Detect
                     # and log — v1 doesn't re-login automatically.
                     login_form = self._page.locator('input[name="weblogin_username"]')
@@ -436,9 +450,10 @@ async def enter_site(base_url: str, *, headless: bool = False) -> BookingSession
         # traffic through a virtual waiting room. If we land there, block
         # until released — the signed pass cookie issued on release lets
         # subsequent navigations in this context sail through for ~24h.
+        queue_stats: dict | None = None
         if is_in_queue(page):
             log.warning("enter_site: virtual waiting room detected on landing")
-            await wait_for_queue_release(page)
+            queue_stats = await wait_for_queue_release(page)
 
         return BookingSession(
             base_url=base_url,
@@ -446,6 +461,7 @@ async def enter_site(base_url: str, *, headless: bool = False) -> BookingSession
             _browser=browser,
             _context=context,
             _page=page,
+            queue_stats=queue_stats,
         )
     except BaseException:
         try:
