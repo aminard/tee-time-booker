@@ -41,6 +41,11 @@ class Plan(BaseModel):
     num_players: int = Field(default=4, ge=1, le=5)
     courses: list[str] = Field(min_length=1)
     preferred_course_order: list[str] | None = None
+    # Optional: bias the picker toward slots near this time within the window.
+    # When None (default), picks the earliest slot within [earliest_time, latest_time].
+    # When set, picks the slot whose tee_time is closest to preferred_time;
+    # course preference still ranks above time preference.
+    preferred_time: time | None = None
 
     def courses_ranked(self) -> list[str]:
         if self.preferred_course_order is None:

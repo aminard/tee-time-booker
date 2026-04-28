@@ -143,15 +143,40 @@ def _course_slug(display_name: str) -> str:
 
 
 def rank_slots(
-    slots: list[TeeTimeSlot], course_order: list[str]
+    slots: list[TeeTimeSlot],
+    course_order: list[str],
+    preferred_time: dtime | None = None,
 ) -> list[TeeTimeSlot]:
-    """Rank eligible slots. Most-preferred course first; within a course, earliest tee time first.
+    """Rank eligible slots. Most-preferred course first.
+
+    Within a course:
+      - If `preferred_time` is None: earliest tee time first (default).
+      - If `preferred_time` is set: closest to that time first; ties broken
+        by earliest. Lets the user say "I'd really like a 9 AM slot, but
+        if there's nothing close I'll fall back to whatever's in window."
 
     Slots whose course isn't in `course_order` are excluded.
     """
     ranked = {slug: i for i, slug in enumerate(course_order)}
     eligible = [s for s in slots if _course_slug(s.course) in ranked]
-    return sorted(eligible, key=lambda s: (ranked[_course_slug(s.course)], s.tee_time))
+
+    if preferred_time is None:
+        return sorted(eligible, key=lambda s: (ranked[_course_slug(s.course)], s.tee_time))
+
+    pref_min = preferred_time.hour * 60 + preferred_time.minute
+
+    def distance_from_preferred(s: TeeTimeSlot) -> int:
+        slot_min = s.tee_time.hour * 60 + s.tee_time.minute
+        return abs(slot_min - pref_min)
+
+    return sorted(
+        eligible,
+        key=lambda s: (
+            ranked[_course_slug(s.course)],   # course preference primary
+            distance_from_preferred(s),        # then time-distance
+            s.tee_time,                        # tie-break by earliest
+        ),
+    )
 
 
 def pick_best_slot(
@@ -428,7 +453,9 @@ async def run_booking(
     if not slots:
         raise RuntimeError("run_booking: no slots in window")
 
-    ranked = rank_slots(slots, plan.courses_ranked())
+    ranked = rank_slots(
+        slots, plan.courses_ranked(), preferred_time=plan.preferred_time
+    )
     result.ranked_top = [(s.course, s.tee_time.strftime("%I:%M %p")) for s in ranked[:5]]
     if not ranked:
         raise RuntimeError("run_booking: no slots match preferred courses")
