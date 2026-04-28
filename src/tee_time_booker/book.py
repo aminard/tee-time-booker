@@ -145,36 +145,37 @@ def _course_slug(display_name: str) -> str:
 def rank_slots(
     slots: list[TeeTimeSlot],
     course_order: list[str],
-    preferred_time: dtime | None = None,
+    preferred_earliest: dtime | None = None,
+    preferred_latest: dtime | None = None,
 ) -> list[TeeTimeSlot]:
     """Rank eligible slots. Most-preferred course first.
 
     Within a course:
-      - If `preferred_time` is None: earliest tee time first (default).
-      - If `preferred_time` is set: closest to that time first; ties broken
-        by earliest. Lets the user say "I'd really like a 9 AM slot, but
-        if there's nothing close I'll fall back to whatever's in window."
+      - Default: earliest tee_time first.
+      - If a preferred range is given: slots whose tee_time falls within
+        [preferred_earliest, preferred_latest] rank above slots outside
+        that range, then earliest within each tier. Lets the user say
+        "I'd really like 8:30-10 AM, but I'll fall back to anywhere in
+        my outer window if nothing in that range is available."
 
     Slots whose course isn't in `course_order` are excluded.
     """
     ranked = {slug: i for i, slug in enumerate(course_order)}
     eligible = [s for s in slots if _course_slug(s.course) in ranked]
 
-    if preferred_time is None:
+    if preferred_earliest is None or preferred_latest is None:
         return sorted(eligible, key=lambda s: (ranked[_course_slug(s.course)], s.tee_time))
 
-    pref_min = preferred_time.hour * 60 + preferred_time.minute
-
-    def distance_from_preferred(s: TeeTimeSlot) -> int:
-        slot_min = s.tee_time.hour * 60 + s.tee_time.minute
-        return abs(slot_min - pref_min)
+    def in_preferred_range(s: TeeTimeSlot) -> bool:
+        slot_t = s.tee_time.time()
+        return preferred_earliest <= slot_t <= preferred_latest
 
     return sorted(
         eligible,
         key=lambda s: (
-            ranked[_course_slug(s.course)],   # course preference primary
-            distance_from_preferred(s),        # then time-distance
-            s.tee_time,                        # tie-break by earliest
+            ranked[_course_slug(s.course)],            # course preference primary
+            0 if in_preferred_range(s) else 1,         # in-range tier above out-of-range
+            s.tee_time,                                # earliest within each tier
         ),
     )
 
@@ -454,7 +455,10 @@ async def run_booking(
         raise RuntimeError("run_booking: no slots in window")
 
     ranked = rank_slots(
-        slots, plan.courses_ranked(), preferred_time=plan.preferred_time
+        slots,
+        plan.courses_ranked(),
+        preferred_earliest=plan.preferred_earliest,
+        preferred_latest=plan.preferred_latest,
     )
     result.ranked_top = [(s.course, s.tee_time.strftime("%I:%M %p")) for s in ranked[:5]]
     if not ranked:
