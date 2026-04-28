@@ -46,6 +46,84 @@ end tell'''
         click.echo(f"warning: could not open log-watcher tabs: {e}", err=True)
 
 
+def _cleanup_spent_plists(*, dry_run: bool, verbose: bool) -> tuple[int, int]:
+    """Scan ~/Library/LaunchAgents/ for spent tee-time-booker plists and
+    unload + remove them. "Spent" = the plist's target booking-open moment
+    is in the past.
+
+    Returns (inspected, cleaned). If `dry_run`, still inspects but doesn't
+    touch anything. If `verbose`, prints per-plist status; otherwise prints
+    only when something is actually cleaned.
+    """
+    import re
+    import subprocess
+    from datetime import date, datetime, timezone
+
+    from tee_time_booker.clock import compute_booking_opens_at
+
+    pattern = re.compile(r"^com\.aminard\.tee-time-booker\.(\d{4}-\d{2}-\d{2})\.plist$")
+    agents_dir = Path.home() / "Library" / "LaunchAgents"
+    if not agents_dir.exists():
+        if verbose:
+            click.echo("No LaunchAgents directory found.")
+        return 0, 0
+
+    now = datetime.now(timezone.utc)
+    inspected = 0
+    cleaned = 0
+
+    for plist_path in sorted(agents_dir.iterdir()):
+        m = pattern.match(plist_path.name)
+        if not m:
+            continue
+        inspected += 1
+        try:
+            target_date = date.fromisoformat(m.group(1))
+            opens_at = compute_booking_opens_at(target_date)
+        except ValueError:
+            click.echo(f"  ?? {plist_path.name} — unparseable target date, skipping")
+            continue
+
+        spent = opens_at < now
+        if spent:
+            action = "would clean" if dry_run else "cleaning"
+            click.echo(f"  ✗ {plist_path.name} — {action} (booking opened {opens_at.astimezone().strftime('%a %Y-%m-%d %I:%M %p %Z')})")
+            if not dry_run:
+                # `launchctl unload` is best-effort; the plist may not be
+                # loaded if the user already unloaded it manually.
+                subprocess.run(
+                    ["launchctl", "unload", str(plist_path)],
+                    check=False,
+                    capture_output=True,
+                )
+                plist_path.unlink()
+                cleaned += 1
+        elif verbose:
+            click.echo(f"  ✓ {plist_path.name} — keep (booking opens {opens_at.astimezone().strftime('%a %Y-%m-%d %I:%M %p %Z')})")
+
+    return inspected, cleaned
+
+
+@cli.command()
+@click.option("--dry-run", is_flag=True, help="Show what would be cleaned without acting.")
+def cleanup(dry_run: bool) -> None:
+    """Remove spent launchd plists for past booking events.
+
+    Scans ~/Library/LaunchAgents/ for tee-time-booker plists whose target
+    booking-open moment has already passed, unloads them via launchctl, and
+    deletes the file. Prevents stale plists from re-firing next year on the
+    same date and reduces clutter as you accumulate weekly runs.
+    """
+    inspected, cleaned = _cleanup_spent_plists(dry_run=dry_run, verbose=True)
+    click.echo()
+    if inspected == 0:
+        click.echo("No tee-time-booker plists found.")
+    elif dry_run:
+        click.echo(f"{inspected} inspected; {cleaned} would be cleaned (dry-run, no changes made).")
+    else:
+        click.echo(f"{inspected} inspected; {cleaned} cleaned.")
+
+
 @cli.command()
 def plan() -> None:
     """Interactive picker — build a plan file for an upcoming weekend."""
@@ -94,6 +172,13 @@ def schedule(
     from tee_time_booker.clock import compute_booking_opens_at
     from tee_time_booker.config import load_plan
     from tee_time_booker.constants import CENTRAL
+
+    # Sweep any spent plists before adding a new one, so ~/Library/LaunchAgents/
+    # doesn't accumulate stale entries that could re-fire next year on the same date.
+    _, cleaned = _cleanup_spent_plists(dry_run=False, verbose=False)
+    if cleaned > 0:
+        click.echo(f"(auto-cleanup: removed {cleaned} spent plist{'s' if cleaned != 1 else ''})")
+        click.echo()
 
     # Auto-size launchd firing lead = login_lead + 2 min buffer for Python startup + NTP.
     if lead_minutes is None:
