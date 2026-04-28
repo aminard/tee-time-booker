@@ -448,6 +448,7 @@ async def run_scheduled_booking(
     keepalive_fast_duration_sec: int = 1200,
     auth_lead_sec: int = 60,
     final_quiet_sec: int = 5,
+    keep_browser_open_sec: int = 0,
 ) -> BookingResult:
     """Run a booking, waiting until the moment booking opens before firing.
 
@@ -501,7 +502,9 @@ async def run_scheduled_booking(
             secrets.base_url,
             headless=headless,
         ) as session:
-            return await run_booking(session, plan, secrets, dry_run=dry_run)
+            result = await run_booking(session, plan, secrets, dry_run=dry_run)
+            await _linger(keep_browser_open_sec)
+            return result
 
     enter_at = opens_at - timedelta(seconds=lead_time_sec)
     now = clock.now_utc()
@@ -523,6 +526,7 @@ async def run_scheduled_booking(
                 session, plan, secrets, clock, opens_at,
                 final_quiet_sec=final_quiet_sec,
                 dry_run=dry_run,
+                keep_browser_open_sec=keep_browser_open_sec,
             )
 
     # Long-lead path: enter site unauthenticated, keepalive, then authenticate
@@ -558,6 +562,7 @@ async def run_scheduled_booking(
             session, plan, secrets, clock, opens_at,
             final_quiet_sec=final_quiet_sec,
             dry_run=dry_run,
+            keep_browser_open_sec=keep_browser_open_sec,
         )
 
 
@@ -570,6 +575,7 @@ async def _wait_and_book(
     *,
     final_quiet_sec: int,
     dry_run: bool,
+    keep_browser_open_sec: int = 0,
 ) -> BookingResult:
     """Quiet wait until booking opens, then fire the booking pipeline."""
     wait_s = (opens_at - clock.now_utc()).total_seconds()
@@ -577,7 +583,24 @@ async def _wait_and_book(
     await clock.sleep_until(opens_at)
 
     log.info("booking open; firing pipeline")
-    return await run_booking(session, plan, secrets, dry_run=dry_run)
+    result = await run_booking(session, plan, secrets, dry_run=dry_run)
+    await _linger(keep_browser_open_sec)
+    return result
+
+
+async def _linger(seconds: int) -> None:
+    """Pause before letting the browser context manager close.
+
+    Useful for inspecting the confirmation page / DevTools after a successful
+    real run. Set via `--keep-browser-open-sec`. Default 0 = close immediately.
+    """
+    if seconds <= 0:
+        return
+    log.warning(
+        "keeping browser open before exit (inspect DevTools / receipt now)",
+        duration_sec=seconds,
+    )
+    await asyncio.sleep(seconds)
 
 
 # ---------------------------------------------------------------------------

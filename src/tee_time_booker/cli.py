@@ -66,12 +66,17 @@ def plan() -> None:
 @click.option("--watch/--no-watch", default=True, show_default=True,
               help="When the armed run fires, auto-open Terminal tabs tailing the "
                    "stdout and stderr logs. Only effective on macOS.")
+@click.option("--keep-browser-open-sec", type=int, default=0, show_default=True,
+              help="After the booking finishes, keep the browser window open for "
+                   "this many seconds before closing. Useful for real runs where "
+                   "you want to inspect the receipt or capture DevTools data.")
 def schedule(
     plan_path: Path,
     confirm: bool,
     lead_minutes: int | None,
     login_lead_seconds: int,
     watch: bool,
+    keep_browser_open_sec: int,
 ) -> None:
     """Generate a launchd plist to run the bot automatically at the plan's booking-open moment.
 
@@ -124,6 +129,12 @@ def schedule(
     err_path = logs_dir / f"{label}.err.log"
 
     watch_arg = "\n        <string>--watch-logs</string>" if watch else ""
+    keep_open_arg = (
+        f"\n        <string>--keep-browser-open-sec</string>"
+        f"\n        <string>{keep_browser_open_sec}</string>"
+        if keep_browser_open_sec > 0
+        else ""
+    )
     plist = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -139,7 +150,7 @@ def schedule(
         <string>tee-time-booker</string>
         <string>run</string>
         <string>--login-lead-seconds</string>
-        <string>{login_lead_seconds}</string>{watch_arg}
+        <string>{login_lead_seconds}</string>{watch_arg}{keep_open_arg}
         <string>{flag}</string>
         <string>{plan_abs}</string>
     </array>
@@ -204,12 +215,17 @@ def schedule(
               help="Open Terminal tabs tailing stdout/stderr as soon as this run "
                    "starts. Intended to be baked into launchd-armed runs via "
                    "`schedule --watch` so the user sees live output automatically.")
+@click.option("--keep-browser-open-sec", type=int, default=0, show_default=True,
+              help="After the booking pipeline finishes, keep the browser window "
+                   "open for this many seconds before closing — lets you inspect "
+                   "the receipt page, capture cookies in DevTools, etc.")
 def run(
     plan_path: Path,
     dry_run: bool,
     confirm: bool,
     login_lead_seconds: int,
     watch_logs: bool,
+    keep_browser_open_sec: int,
 ) -> None:
     """Execute a booking run against a plan.
 
@@ -258,7 +274,10 @@ def run(
     try:
         result = asyncio.run(
             run_scheduled_booking(
-                plan, secrets, dry_run=not confirm, lead_time_sec=login_lead_seconds
+                plan, secrets,
+                dry_run=not confirm,
+                lead_time_sec=login_lead_seconds,
+                keep_browser_open_sec=keep_browser_open_sec,
             )
         )
     except Exception as e:
