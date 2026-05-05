@@ -517,6 +517,22 @@ async def run_booking(
     )
     result.steps_completed.append("finalize")
 
+    # Navigate the visible browser tab to the receipt page. The finalize POST
+    # used an in-page fetch (not a navigation) so the tab is still rendering
+    # the checkout form — without this nav, --keep-browser-open-sec leaves
+    # the user staring at the previous step instead of the actual confirmation.
+    if result.confirmation_url:
+        try:
+            log.info("navigating browser to confirmation page", url=result.confirmation_url)
+            await session.get(result.confirmation_url)
+        except Exception as e:
+            # Booking is already committed server-side — failure to load the
+            # receipt page is cosmetic, not catastrophic.
+            log.warning(
+                "could not navigate to confirmation page (booking still succeeded)",
+                error=str(e),
+            )
+
     return result
 
 
