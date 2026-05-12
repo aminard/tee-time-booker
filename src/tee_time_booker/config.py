@@ -48,6 +48,13 @@ class Plan(BaseModel):
     # 7-12 slot if nothing in that range is available."
     preferred_earliest: time | None = None
     preferred_latest: time | None = None
+    # How many minutes off-preferred-window we'll absorb to stay at a
+    # higher-priority course. Each step down the course list adds this
+    # many "minutes" to a slot's score. 0 = pure time-first (course
+    # becomes a tiebreaker); large = course-first (current legacy
+    # behavior). Calibrated default 25 keeps the user's top course as
+    # long as it's within ~25 min of preferred.
+    course_downgrade_minutes: int = Field(default=25, ge=0)
 
     @model_validator(mode="after")
     def _validate_preferred_range(self) -> "Plan":

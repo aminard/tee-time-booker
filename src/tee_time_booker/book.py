@@ -142,21 +142,38 @@ def _course_slug(display_name: str) -> str:
     return display_name.lower().replace(" ", "_")
 
 
+def _minutes_from_range(t: dtime, lo: dtime, hi: dtime) -> int:
+    """Minutes between `t` and the [lo, hi] range. 0 if inside."""
+    if lo <= t <= hi:
+        return 0
+    t_m = t.hour * 60 + t.minute
+    if t < lo:
+        return (lo.hour * 60 + lo.minute) - t_m
+    return t_m - (hi.hour * 60 + hi.minute)
+
+
 def rank_slots(
     slots: list[TeeTimeSlot],
     course_order: list[str],
     preferred_earliest: dtime | None = None,
     preferred_latest: dtime | None = None,
+    course_downgrade_minutes: int = 25,
 ) -> list[TeeTimeSlot]:
-    """Rank eligible slots. Most-preferred course first.
+    """Rank eligible slots by a single score; lower is better.
 
-    Within a course:
-      - Default: earliest tee_time first.
-      - If a preferred range is given: slots whose tee_time falls within
-        [preferred_earliest, preferred_latest] rank above slots outside
-        that range, then earliest within each tier. Lets the user say
-        "I'd really like 8:30-10 AM, but I'll fall back to anywhere in
-        my outer window if nothing in that range is available."
+    With a preferred range set, each slot's score is:
+
+        score = minutes_from_preferred_range
+              + course_rank * course_downgrade_minutes
+
+    Where `course_rank` is the slot's course position in `course_order`
+    (top = 0). `course_downgrade_minutes` controls the tradeoff: it's the
+    number of "off-preferred minutes" a slot at a lower-priority course
+    is penalized per step down the list. Setting it to 0 makes ranking
+    pure time-first; setting it large reproduces the old course-first
+    behavior. Tiebreak: earliest tee_time first.
+
+    Without a preferred range, falls back to (course_rank, tee_time).
 
     Slots whose course isn't in `course_order` are excluded.
     """
@@ -166,18 +183,12 @@ def rank_slots(
     if preferred_earliest is None or preferred_latest is None:
         return sorted(eligible, key=lambda s: (ranked[_course_slug(s.course)], s.tee_time))
 
-    def in_preferred_range(s: TeeTimeSlot) -> bool:
-        slot_t = s.tee_time.time()
-        return preferred_earliest <= slot_t <= preferred_latest
+    def score(s: TeeTimeSlot):
+        distance = _minutes_from_range(s.tee_time.time(), preferred_earliest, preferred_latest)
+        course_rank = ranked[_course_slug(s.course)]
+        return (distance + course_rank * course_downgrade_minutes, s.tee_time)
 
-    return sorted(
-        eligible,
-        key=lambda s: (
-            ranked[_course_slug(s.course)],            # course preference primary
-            0 if in_preferred_range(s) else 1,         # in-range tier above out-of-range
-            s.tee_time,                                # earliest within each tier
-        ),
-    )
+    return sorted(eligible, key=score)
 
 
 def pick_best_slot(
@@ -459,6 +470,7 @@ async def run_booking(
         plan.courses_ranked(),
         preferred_earliest=plan.preferred_earliest,
         preferred_latest=plan.preferred_latest,
+        course_downgrade_minutes=plan.course_downgrade_minutes,
     )
     result.ranked_top = [(s.course, s.tee_time.strftime("%I:%M %p")) for s in ranked[:5]]
     if not ranked:
