@@ -8,6 +8,38 @@ def cli() -> None:
     """A personal tee-time reservation assistant for municipal golf courses in Austin, TX."""
 
 
+import re as _re
+
+_ANSI_ESCAPE_RE = _re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+
+class _Tee:
+    """Mirror writes to a terminal stream and a log file, stripping ANSI
+    color escapes from the file copy so post-hoc readers (grep, jq) see
+    clean text. Used by `run` to persist the structlog timeline for
+    manual invocations — the launchd path already captures via plist.
+    """
+
+    def __init__(self, terminal, file):
+        self._terminal = terminal
+        self._file = file
+
+    def write(self, data):
+        self._terminal.write(data)
+        self._file.write(_ANSI_ESCAPE_RE.sub("", data))
+        return len(data)
+
+    def flush(self):
+        self._terminal.flush()
+        self._file.flush()
+
+    def isatty(self):
+        return self._terminal.isatty()
+
+    def fileno(self):
+        return self._terminal.fileno()
+
+
 def _open_log_watcher_tabs(target_date) -> None:
     """Pop open two Terminal.app tabs tailing this run's stdout and stderr logs.
 
@@ -323,6 +355,7 @@ def run(
 
     import asyncio
     import json
+    import sys
     import traceback
     from datetime import datetime
 
@@ -333,169 +366,183 @@ def run(
     from tee_time_booker.config import Secrets, load_plan
     from tee_time_booker.constants import CENTRAL
 
-    structlog.configure(
-        processors=[
-            structlog.processors.TimeStamper(fmt="iso"),
-            structlog.dev.ConsoleRenderer(),
-        ],
-    )
-
-    load_dotenv()
-    secrets = Secrets()  # type: ignore[call-arg]
-    plan = load_plan(plan_path)
-
-    if watch_logs:
-        _open_log_watcher_tabs(plan.target_date)
-
     logs_dir = Path("logs")
     logs_dir.mkdir(exist_ok=True)
     run_id = datetime.now(tz=CENTRAL).strftime("%Y-%m-%dT%H%M%S")
     result_path = logs_dir / f"{run_id}-result.json"
+    log_path = logs_dir / f"{run_id}.log"
 
-    started_at = datetime.now(tz=CENTRAL)
-    result = None
-    error = None
-    error_traceback = None
+    log_file = log_path.open("w", buffering=1)
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    sys.stdout = _Tee(original_stdout, log_file)
+    sys.stderr = _Tee(original_stderr, log_file)
+
     try:
-        result = asyncio.run(
-            run_scheduled_booking(
-                plan, secrets,
-                dry_run=not confirm,
-                lead_time_sec=login_lead_seconds,
-                keep_browser_open_sec=keep_browser_open_sec,
-            )
+        structlog.configure(
+            processors=[
+                structlog.processors.TimeStamper(fmt="iso"),
+                structlog.dev.ConsoleRenderer(),
+            ],
         )
-    except BookingRunError as e:
-        # Bot ran but failed inside the pipeline; e.partial_result has the
-        # diagnostic context populated before the browser closed.
-        result = e.partial_result
-        error = e.__cause__ or e
-        error_traceback = traceback.format_exception(type(error), error, error.__traceback__)
-        error_traceback = "".join(error_traceback)
-    except Exception as e:
-        # Unexpected error before/after the pipeline (e.g. NTP failure, config
-        # error, browser launch failure). No partial_result available.
-        error = e
-        error_traceback = traceback.format_exc()
-    finished_at = datetime.now(tz=CENTRAL)
 
-    summary = {
-        # Identity & timing
-        "run_id": run_id,
-        "started_at": started_at.isoformat(timespec="seconds"),
-        "finished_at": finished_at.isoformat(timespec="seconds"),
-        "duration_seconds": round((finished_at - started_at).total_seconds(), 2),
-        "target_date": plan.target_date.isoformat(),
-        "plan_path": str(plan_path),
-        "mode": "real" if confirm else "dry_run",
-        "success": error is None,
+        load_dotenv()
+        secrets = Secrets()  # type: ignore[call-arg]
+        plan = load_plan(plan_path)
 
-        # Pipeline progress
-        "steps_completed": result.steps_completed if result else [],
-        "slot": (
-            {
-                "course": result.slot.course,
-                "tee_time": result.slot.tee_time.isoformat(),
-                "grfmid": result.slot.grfmid,
-            }
-            if result and result.slot
-            else None
-        ),
-        "confirmation_url": result.confirmation_url if result else None,
+        click.echo(f"Logging structlog timeline to: {log_path}")
 
-        # Search context
-        "slots_total_found": result.slots_total_found if result else None,
-        "slots_in_window": result.slots_in_window if result else None,
-        "ranked_top": (
-            [{"course": c, "time": t} for c, t in result.ranked_top]
-            if result and result.ranked_top
-            else []
-        ),
+        if watch_logs:
+            _open_log_watcher_tabs(plan.target_date)
 
-        # Queue context
-        "queue_encountered": result.queue_encountered if result else False,
-        "queue_wait_sec": result.queue_wait_sec if result else None,
-        "queue_id": result.queue_id if result else None,
-        "queue_headline_at_release": result.queue_headline_at_release if result else None,
-
-        # Failure context
-        "failed_step": result.failed_step if result else None,
-        "failed_url": result.failed_url if result else None,
-        "failed_page_title": result.failed_page_title if result else None,
-
-        # Timing breakdown
-        "time_in_keepalive_sec": result.time_in_keepalive_sec if result else None,
-        "time_in_pipeline_sec": result.time_in_pipeline_sec if result else None,
-
-        # Error
-        "error": str(error) if error else None,
-        "error_type": type(error).__name__ if error else None,
-        "error_traceback": error_traceback,
-    }
-    result_path.write_text(json.dumps(summary, indent=2, default=str))
-
-    # Append a one-line entry to the registry for chronological history
-    # scanning (e.g. `tail logs/index.jsonl | jq`).
-    registry_path = logs_dir / "index.jsonl"
-    registry_entry = {
-        k: summary[k]
-        for k in (
-            "run_id",
-            "started_at",
-            "finished_at",
-            "duration_seconds",
-            "target_date",
-            "mode",
-            "success",
-            "steps_completed",
-            "slot",
-            "confirmation_url",
-            "slots_total_found",
-            "slots_in_window",
-            "queue_encountered",
-            "queue_wait_sec",
-            "failed_step",
-            "failed_url",
-            "time_in_keepalive_sec",
-            "time_in_pipeline_sec",
-            "error",
-            "error_type",
-        )
-    }
-    with registry_path.open("a") as f:
-        f.write(json.dumps(registry_entry, default=str) + "\n")
-
-    click.echo()
-    if error is None:
-        click.echo("=== DONE ===" if confirm else "=== DRY RUN DONE ===")
-        click.echo(f"Steps: {' → '.join(result.steps_completed)}")
-        if result.slot:
-            click.echo(
-                f"Slot:  {result.slot.course} @ "
-                f"{result.slot.tee_time.strftime('%a %m/%d %I:%M %p')}"
+        started_at = datetime.now(tz=CENTRAL)
+        result = None
+        error = None
+        error_traceback = None
+        try:
+            result = asyncio.run(
+                run_scheduled_booking(
+                    plan, secrets,
+                    dry_run=not confirm,
+                    lead_time_sec=login_lead_seconds,
+                    keep_browser_open_sec=keep_browser_open_sec,
+                )
             )
-        if result.confirmation_url:
-            click.echo(f"Confirmation URL: {result.confirmation_url}")
-        if result.queue_encountered:
-            click.echo(f"Queue: waited {result.queue_wait_sec}s")
-    else:
-        click.secho(f"=== FAILED: {type(error).__name__}: {error} ===", fg="red")
-        if result and result.steps_completed:
-            click.echo(f"Steps completed before failure: {' → '.join(result.steps_completed)}")
-        if result and result.failed_step:
-            click.echo(f"Failed step:    {result.failed_step}")
-        if result and result.failed_url:
-            click.echo(f"Failed URL:     {result.failed_url}")
-            click.echo(f"Failed title:   {result.failed_page_title or '?'}")
-        if result and result.queue_encountered:
-            click.echo(f"Queue:          waited {result.queue_wait_sec}s")
+        except BookingRunError as e:
+            # Bot ran but failed inside the pipeline; e.partial_result has the
+            # diagnostic context populated before the browser closed.
+            result = e.partial_result
+            error = e.__cause__ or e
+            error_traceback = traceback.format_exception(type(error), error, error.__traceback__)
+            error_traceback = "".join(error_traceback)
+        except Exception as e:
+            # Unexpected error before/after the pipeline (e.g. NTP failure, config
+            # error, browser launch failure). No partial_result available.
+            error = e
+            error_traceback = traceback.format_exc()
+        finished_at = datetime.now(tz=CENTRAL)
 
-    click.echo()
-    click.echo(f"Result summary: {result_path.resolve()}")
-    click.echo(f"Registry:       {registry_path.resolve()}")
+        summary = {
+            # Identity & timing
+            "run_id": run_id,
+            "started_at": started_at.isoformat(timespec="seconds"),
+            "finished_at": finished_at.isoformat(timespec="seconds"),
+            "duration_seconds": round((finished_at - started_at).total_seconds(), 2),
+            "target_date": plan.target_date.isoformat(),
+            "plan_path": str(plan_path),
+            "mode": "real" if confirm else "dry_run",
+            "success": error is None,
 
-    if error is not None:
-        raise error
+            # Pipeline progress
+            "steps_completed": result.steps_completed if result else [],
+            "slot": (
+                {
+                    "course": result.slot.course,
+                    "tee_time": result.slot.tee_time.isoformat(),
+                    "grfmid": result.slot.grfmid,
+                }
+                if result and result.slot
+                else None
+            ),
+            "confirmation_url": result.confirmation_url if result else None,
+
+            # Search context
+            "slots_total_found": result.slots_total_found if result else None,
+            "slots_in_window": result.slots_in_window if result else None,
+            "ranked_top": (
+                [{"course": c, "time": t} for c, t in result.ranked_top]
+                if result and result.ranked_top
+                else []
+            ),
+
+            # Queue context
+            "queue_encountered": result.queue_encountered if result else False,
+            "queue_wait_sec": result.queue_wait_sec if result else None,
+            "queue_id": result.queue_id if result else None,
+            "queue_headline_at_release": result.queue_headline_at_release if result else None,
+
+            # Failure context
+            "failed_step": result.failed_step if result else None,
+            "failed_url": result.failed_url if result else None,
+            "failed_page_title": result.failed_page_title if result else None,
+
+            # Timing breakdown
+            "time_in_keepalive_sec": result.time_in_keepalive_sec if result else None,
+            "time_in_pipeline_sec": result.time_in_pipeline_sec if result else None,
+
+            # Error
+            "error": str(error) if error else None,
+            "error_type": type(error).__name__ if error else None,
+            "error_traceback": error_traceback,
+        }
+        result_path.write_text(json.dumps(summary, indent=2, default=str))
+
+        # Append a one-line entry to the registry for chronological history
+        # scanning (e.g. `tail logs/index.jsonl | jq`).
+        registry_path = logs_dir / "index.jsonl"
+        registry_entry = {
+            k: summary[k]
+            for k in (
+                "run_id",
+                "started_at",
+                "finished_at",
+                "duration_seconds",
+                "target_date",
+                "mode",
+                "success",
+                "steps_completed",
+                "slot",
+                "confirmation_url",
+                "slots_total_found",
+                "slots_in_window",
+                "queue_encountered",
+                "queue_wait_sec",
+                "failed_step",
+                "failed_url",
+                "time_in_keepalive_sec",
+                "time_in_pipeline_sec",
+                "error",
+                "error_type",
+            )
+        }
+        with registry_path.open("a") as f:
+            f.write(json.dumps(registry_entry, default=str) + "\n")
+
+        click.echo()
+        if error is None:
+            click.echo("=== DONE ===" if confirm else "=== DRY RUN DONE ===")
+            click.echo(f"Steps: {' → '.join(result.steps_completed)}")
+            if result.slot:
+                click.echo(
+                    f"Slot:  {result.slot.course} @ "
+                    f"{result.slot.tee_time.strftime('%a %m/%d %I:%M %p')}"
+                )
+            if result.confirmation_url:
+                click.echo(f"Confirmation URL: {result.confirmation_url}")
+            if result.queue_encountered:
+                click.echo(f"Queue: waited {result.queue_wait_sec}s")
+        else:
+            click.secho(f"=== FAILED: {type(error).__name__}: {error} ===", fg="red")
+            if result and result.steps_completed:
+                click.echo(f"Steps completed before failure: {' → '.join(result.steps_completed)}")
+            if result and result.failed_step:
+                click.echo(f"Failed step:    {result.failed_step}")
+            if result and result.failed_url:
+                click.echo(f"Failed URL:     {result.failed_url}")
+                click.echo(f"Failed title:   {result.failed_page_title or '?'}")
+            if result and result.queue_encountered:
+                click.echo(f"Queue:          waited {result.queue_wait_sec}s")
+
+        click.echo()
+        click.echo(f"Result summary: {result_path.resolve()}")
+        click.echo(f"Registry:       {registry_path.resolve()}")
+        click.echo(f"Log timeline:   {log_path.resolve()}")
+
+        if error is not None:
+            raise error
+    finally:
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        log_file.close()
 
 
 @cli.command()
