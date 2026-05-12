@@ -424,6 +424,7 @@ def run(
         summary = {
             # Identity & timing
             "run_id": run_id,
+            "kind": "booking",
             "started_at": started_at.isoformat(timespec="seconds"),
             "finished_at": finished_at.isoformat(timespec="seconds"),
             "duration_seconds": round((finished_at - started_at).total_seconds(), 2),
@@ -483,6 +484,7 @@ def run(
             k: summary[k]
             for k in (
                 "run_id",
+                "kind",
                 "started_at",
                 "finished_at",
                 "duration_seconds",
@@ -546,8 +548,181 @@ def run(
 
 
 @cli.command()
-@click.argument("confirmation_number")
+@click.argument("confirmation_numbers")
 @click.argument("tee_time")
-def cancel(confirmation_number: str, tee_time: str) -> None:
-    """Cancel a booking given its confirmation number and tee-time."""
-    raise NotImplementedError("cancel: not implemented yet (flow not captured)")
+@click.option("--dry-run", is_flag=True, help="Run full cancellation flow but stop before the binding POST.")
+@click.option("--confirm", is_flag=True, help="Required for a real cancellation (no-op without it).")
+@click.option("--keep-browser-open-sec", type=int, default=0, show_default=True,
+              help="After the cancellation pipeline finishes, keep the browser window "
+                   "open for this many seconds before closing.")
+def cancel(
+    confirmation_numbers: str,
+    tee_time: str,
+    dry_run: bool,
+    confirm: bool,
+    keep_browser_open_sec: int,
+) -> None:
+    """Cancel an existing booking.
+
+    \b
+    CONFIRMATION_NUMBERS: comma-separated per-player numbers, e.g.
+        "313093472,313093479,313093485,313093489"
+    TEE_TIME: time of day in "H:MM AM|PM" form, e.g. "7:10 AM"
+
+    Mirrors `run`: requires either --dry-run or --confirm. Dry-run stops
+    after the cart is loaded with cancel items (no binding POST).
+    """
+    if not dry_run and not confirm:
+        raise click.UsageError("Real cancellations require --confirm. Use --dry-run otherwise.")
+
+    import asyncio
+    import json
+    import re
+    import sys
+    import traceback
+    from datetime import datetime, time as dtime
+
+    import structlog
+    from dotenv import load_dotenv
+
+    from tee_time_booker.book import run_cancellation
+    from tee_time_booker.config import Secrets
+    from tee_time_booker.constants import CENTRAL
+    from tee_time_booker.session import login
+
+    # Parse confirmation numbers (comma-separated, whitespace-tolerant)
+    numbers = [n.strip() for n in confirmation_numbers.split(",") if n.strip()]
+    if not numbers:
+        raise click.UsageError("Need at least one confirmation number.")
+    for n in numbers:
+        if not n.isdigit():
+            raise click.UsageError(f"Confirmation number must be all digits: {n!r}")
+
+    # Parse "7:10 AM" → datetime.time
+    m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*(AM|PM|am|pm)\s*$", tee_time)
+    if not m:
+        raise click.UsageError(f"tee_time must look like '7:10 AM', got {tee_time!r}")
+    h, mm, ap = int(m.group(1)), int(m.group(2)), m.group(3).upper()
+    if not (1 <= h <= 12) or not (0 <= mm <= 59):
+        raise click.UsageError(f"Invalid time: {tee_time!r}")
+    parsed_time = dtime(hour=(h % 12) + (12 if ap == "PM" else 0), minute=mm)
+
+    logs_dir = Path("logs")
+    logs_dir.mkdir(exist_ok=True)
+    run_id = datetime.now(tz=CENTRAL).strftime("%Y-%m-%dT%H%M%S")
+    result_path = logs_dir / f"{run_id}-cancel-result.json"
+    log_path = logs_dir / f"{run_id}.log"
+
+    log_file = log_path.open("w", buffering=1)
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    sys.stdout = _Tee(original_stdout, log_file)
+    sys.stderr = _Tee(original_stderr, log_file)
+
+    try:
+        structlog.configure(
+            processors=[
+                structlog.processors.TimeStamper(fmt="iso"),
+                structlog.dev.ConsoleRenderer(),
+            ],
+        )
+
+        load_dotenv()
+        secrets = Secrets()  # type: ignore[call-arg]
+
+        click.echo(f"Logging structlog timeline to: {log_path}")
+        click.echo(f"Cancelling {len(numbers)} confirmation number(s) at {parsed_time.strftime('%I:%M %p').lstrip('0')}")
+        if not confirm:
+            click.echo("(dry-run — will NOT submit the binding cancellation POST)")
+
+        async def _go():
+            session = await login(
+                secrets.username,
+                secrets.password.get_secret_value(),
+                secrets.base_url,
+            )
+            try:
+                result = await run_cancellation(
+                    session,
+                    numbers,
+                    parsed_time,
+                    secrets,
+                    dry_run=not confirm,
+                )
+                if keep_browser_open_sec > 0:
+                    click.echo(f"(keeping browser open for {keep_browser_open_sec}s)")
+                    await asyncio.sleep(keep_browser_open_sec)
+                return result
+            finally:
+                await session.close()
+
+        started_at = datetime.now(tz=CENTRAL)
+        result = None
+        error = None
+        error_traceback = None
+        try:
+            result = asyncio.run(_go())
+        except Exception as e:
+            error = e
+            error_traceback = traceback.format_exc()
+        finished_at = datetime.now(tz=CENTRAL)
+
+        summary = {
+            "run_id": run_id,
+            "kind": "cancellation",
+            "started_at": started_at.isoformat(timespec="seconds"),
+            "finished_at": finished_at.isoformat(timespec="seconds"),
+            "duration_seconds": round((finished_at - started_at).total_seconds(), 2),
+            "mode": "real" if confirm else "dry_run",
+            "success": error is None,
+            "confirmation_numbers": numbers,
+            "tee_time": parsed_time.strftime("%H:%M"),
+            "steps_completed": result.steps_completed if result else [],
+            "confirmation_url": result.confirmation_url if result else None,
+            "error": str(error) if error else None,
+            "error_type": type(error).__name__ if error else None,
+            "error_traceback": error_traceback,
+        }
+        result_path.write_text(json.dumps(summary, indent=2, default=str))
+
+        registry_path = logs_dir / "index.jsonl"
+        registry_entry = {
+            k: summary[k]
+            for k in (
+                "run_id",
+                "kind",
+                "started_at",
+                "finished_at",
+                "duration_seconds",
+                "mode",
+                "success",
+                "confirmation_numbers",
+                "tee_time",
+                "steps_completed",
+                "confirmation_url",
+                "error",
+                "error_type",
+            )
+        }
+        with registry_path.open("a") as f:
+            f.write(json.dumps(registry_entry, default=str) + "\n")
+
+        click.echo()
+        if error is None:
+            click.echo("=== CANCEL DONE ===" if confirm else "=== CANCEL DRY RUN DONE ===")
+            click.echo(f"Steps: {' → '.join(result.steps_completed)}")
+            if result.confirmation_url:
+                click.echo(f"Confirmation URL: {result.confirmation_url}")
+        else:
+            click.secho(f"=== FAILED: {type(error).__name__}: {error} ===", fg="red")
+
+        click.echo()
+        click.echo(f"Result summary: {result_path.resolve()}")
+        click.echo(f"Registry:       {registry_path.resolve()}")
+        click.echo(f"Log timeline:   {log_path.resolve()}")
+
+        if error is not None:
+            raise error
+    finally:
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        log_file.close()
