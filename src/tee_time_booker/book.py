@@ -904,6 +904,16 @@ async def run_cancellation(
     )
     result.steps_completed.append("finalize")
 
+    if result.confirmation_url:
+        try:
+            log.info("navigating browser to confirmation page", url=result.confirmation_url)
+            await session.get(result.confirmation_url)
+        except Exception as e:
+            log.warning(
+                "could not navigate to confirmation page (cancellation still succeeded)",
+                error=str(e),
+            )
+
     return result
 
 
