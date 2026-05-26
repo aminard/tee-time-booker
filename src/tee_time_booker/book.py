@@ -108,6 +108,12 @@ class BookingResult:
     steps_completed: list[str] = field(default_factory=list)
     checkout_form: CheckoutForm | None = None
     confirmation_url: str | None = None
+    # Per-player confirmation numbers (one per player). Populated after
+    # finalize by scraping the My History account page — the only place
+    # WebTrac exposes per-player numbers in HTML (the confirmation page
+    # itself shows only the transaction receipt number). Needed for the
+    # cancel flow. Empty list if scrape failed or dry-run.
+    confirmation_numbers: list[str] = field(default_factory=list)
 
     # --- Diagnostic context (populated as the run progresses) ---
     # Search context — counts before / after time-window filter, and the top of
@@ -394,6 +400,104 @@ async def load_checkout_form(session: BookingSession, csrf_token: str) -> Checko
     return CheckoutForm(action_url=action, hidden_fields=hidden, csrf_token=form_csrf)
 
 
+async def scrape_confirmation_numbers(
+    session: "BookingSession",
+    slot: TeeTimeSlot,
+) -> list[str]:
+    """Fetch the My History account page and extract per-player confirmation
+    numbers for the just-booked slot.
+
+    Why this exists: WebTrac's `/confirmation.html` page (which `finalize_booking`
+    lands on) only displays the transaction receipt number (e.g. 7316641),
+    NOT the per-player confirmation numbers (e.g. 318107910..318107916 for
+    a 4-player booking). The per-player numbers are required for cancellation
+    via `webteetimecancel_confirmationnumber`. They live in two places:
+    (a) the emailed PDF receipt, and (b) the My History account page where
+    each booking row has a "Questions" button linking to
+    `questioninfo.html?fmid=<per-player-confirmation-number>`. We scrape (b).
+
+    Best-effort: returns [] on any failure. The booking has already committed
+    by the time this is called, so scrape failure isn't catastrophic — just
+    means Andrew has to dig through the email PDF if he wants to cancel.
+
+    Verified against 5/11 (313093472,...479,...485,...489) and 5/25
+    (318107910,...912,...914,...916) — both matched email PDFs exactly.
+    """
+    import re as _re
+
+    from bs4 import BeautifulSoup
+
+    url = (
+        f"{session.base_url}/history.html"
+        f"?historyoption=inquiry&_csrf_token={session.csrf_token}"
+    )
+    log.info("scrape_confirmation_numbers: GET", url=url)
+    try:
+        resp = await session.get(url)
+    except Exception as e:
+        log.warning("scrape_confirmation_numbers: GET failed", error=str(e))
+        return []
+    if not resp.ok:
+        log.warning(
+            "scrape_confirmation_numbers: non-OK response",
+            status=resp.status,
+            url=resp.url,
+        )
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    rows = soup.select("table#webhistory_resultsoutput tbody tr")
+    if not rows:
+        log.warning("scrape_confirmation_numbers: no result rows in history table")
+        return []
+
+    # Build matchers tolerant to WebTrac's display quirks:
+    # - Time format: "11:41 am" for 2-digit hours, " 7:10 am" (extra leading
+    #   space) for 1-digit hours. Match with a regex anchored on "at\s+".
+    # - Date: zero-padded mm/dd/yyyy, appears verbatim.
+    # - Course: full display name appears as "on <Course> Golf Course".
+    course_name = slot.course  # e.g. "Roy Kizer"
+    date_str = slot.tee_time.strftime("%m/%d/%Y")
+    time_str = slot.tee_time.strftime("%I:%M %p").lstrip("0").lower()
+    time_re = _re.compile(r"at\s+" + _re.escape(time_str) + r",", _re.IGNORECASE)
+
+    numbers: list[str] = []
+    for tr in rows:
+        desc_cell = tr.find("td", {"data-title": "Description"})
+        status_cell = tr.find("td", {"data-title": "Status"})
+        questions_cell = tr.find("td", {"data-title": "Question(s)"})
+        if not (desc_cell and status_cell and questions_cell):
+            continue
+
+        desc = desc_cell.get_text(strip=False)
+        status = status_cell.get_text(strip=True)
+
+        if status != "Reserved":
+            continue
+        if course_name not in desc:
+            continue
+        if date_str not in desc:
+            continue
+        if not time_re.search(desc):
+            continue
+
+        a = questions_cell.find("a", href=True)
+        if not a:
+            continue
+        m = _re.search(r"fmid=(\d+)", a["href"])
+        if m:
+            numbers.append(m.group(1))
+
+    log.info(
+        "scrape_confirmation_numbers: extracted",
+        count=len(numbers),
+        numbers=numbers,
+        slot_course=slot.course,
+        slot_tee_time=slot.tee_time.isoformat(),
+    )
+    return numbers
+
+
 async def finalize_booking(
     session: BookingSession,
     checkout_form: CheckoutForm,
@@ -553,6 +657,20 @@ async def run_booking(
             # receipt page is cosmetic, not catastrophic.
             log.warning(
                 "could not navigate to confirmation page (booking still succeeded)",
+                error=str(e),
+            )
+
+    # Scrape per-player confirmation numbers from the My History account
+    # page. Best-effort: booking already committed; failure here just means
+    # Andrew has to look in the email PDF if he wants to cancel later.
+    if result.slot:
+        try:
+            result.confirmation_numbers = await scrape_confirmation_numbers(
+                session, result.slot
+            )
+        except Exception as e:
+            log.warning(
+                "scrape_confirmation_numbers failed (booking still succeeded)",
                 error=str(e),
             )
 

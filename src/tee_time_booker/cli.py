@@ -445,6 +445,7 @@ def run(
                 else None
             ),
             "confirmation_url": result.confirmation_url if result else None,
+            "confirmation_numbers": result.confirmation_numbers if result else [],
 
             # Search context
             "slots_total_found": result.slots_total_found if result else None,
@@ -499,6 +500,7 @@ def run(
                 "steps_completed",
                 "slot",
                 "confirmation_url",
+                "confirmation_numbers",
                 "slots_total_found",
                 "slots_in_window",
                 "queue_encountered",
@@ -527,6 +529,8 @@ def run(
                 )
             if result.confirmation_url:
                 click.echo(f"Confirmation URL: {result.confirmation_url}")
+            if result.confirmation_numbers:
+                click.echo(f"Conf numbers:     {','.join(result.confirmation_numbers)}")
             if result.queue_encountered:
                 click.echo(f"Queue: waited {result.queue_wait_sec}s")
         else:
