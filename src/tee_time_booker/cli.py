@@ -460,6 +460,11 @@ def run(
             "queue_wait_sec": result.queue_wait_sec if result else None,
             "queue_id": result.queue_id if result else None,
             "queue_headline_at_release": result.queue_headline_at_release if result else None,
+            "queue_phase1_sample_count": result.queue_phase1_sample_count if result else None,
+            "queue_phase2_sample_count": result.queue_phase2_sample_count if result else None,
+            "queue_phase2_start_utc": result.queue_phase2_start_utc if result else None,
+            "queue_phase2_initial_progress": result.queue_phase2_initial_progress if result else None,
+            "queue_phase2_last_progress": result.queue_phase2_last_progress if result else None,
 
             # Failure context
             "failed_step": result.failed_step if result else None,
@@ -498,6 +503,8 @@ def run(
                 "slots_in_window",
                 "queue_encountered",
                 "queue_wait_sec",
+                "queue_phase2_initial_progress",
+                "queue_phase2_last_progress",
                 "failed_step",
                 "failed_url",
                 "time_in_keepalive_sec",

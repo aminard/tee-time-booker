@@ -123,6 +123,17 @@ class BookingResult:
     queue_wait_sec: float | None = None
     queue_id: str | None = None
     queue_headline_at_release: str | None = None
+    # Queue-it spa-api status diagnostics. Phase 1 = pre-queue holding,
+    # Phase 2 = release-in-progress. `phase2_start_utc` minus the official
+    # 8:00 PM gate-open moment gives the server's Phase-1→2 transition lag
+    # (observed ~30 s on 2026-05-25). `phase2_initial_progress` and
+    # `phase2_last_progress` track our position-indicator at the start and
+    # end of Phase 2. Full per-poll samples live on the structlog timeline.
+    queue_phase1_sample_count: int | None = None
+    queue_phase2_sample_count: int | None = None
+    queue_phase2_start_utc: str | None = None
+    queue_phase2_initial_progress: float | None = None
+    queue_phase2_last_progress: float | None = None
 
     # Failure context — populated only on exception, captured before the
     # browser context closes so we know the bot's last-known state.
@@ -561,8 +572,8 @@ async def run_scheduled_booking(
     lead_time_sec: int = 30,
     headless: bool = False,
     keepalive_interval_sec: int = 90,
-    keepalive_fast_interval_sec: int = 15,
-    keepalive_fast_duration_sec: int = 1800,
+    keepalive_tight_interval_sec: int = 5,
+    keepalive_tight_window_sec: int = 900,
     auth_lead_sec: int = 60,
     final_quiet_sec: int = 5,
     keep_browser_open_sec: int = 0,
@@ -669,8 +680,8 @@ async def run_scheduled_booking(
             await session.keepalive(
                 clock, auth_at,
                 interval_sec=keepalive_interval_sec,
-                fast_interval_sec=keepalive_fast_interval_sec,
-                fast_duration_sec=keepalive_fast_duration_sec,
+                tight_interval_sec=keepalive_tight_interval_sec,
+                tight_window_sec=keepalive_tight_window_sec,
             )
         result.time_in_keepalive_sec = round(_time.monotonic() - t_keepalive_start, 1)
 
@@ -771,10 +782,16 @@ def _promote_session_diagnostics(session, result: BookingResult, t_start: float)
 
     result.time_in_pipeline_sec = round(time.monotonic() - t_start, 1)
     if session.queue_stats:
+        stats = session.queue_stats
         result.queue_encountered = True
-        result.queue_wait_sec = session.queue_stats.get("wait_sec")
-        result.queue_id = session.queue_stats.get("queue_id")
-        result.queue_headline_at_release = session.queue_stats.get("headline_at_release")
+        result.queue_wait_sec = stats.get("wait_sec")
+        result.queue_id = stats.get("queue_id")
+        result.queue_headline_at_release = stats.get("headline_at_release")
+        result.queue_phase1_sample_count = stats.get("phase1_sample_count")
+        result.queue_phase2_sample_count = stats.get("phase2_sample_count")
+        result.queue_phase2_start_utc = stats.get("phase2_start_utc")
+        result.queue_phase2_initial_progress = stats.get("phase2_initial_progress")
+        result.queue_phase2_last_progress = stats.get("phase2_last_progress")
 
 
 async def _linger(seconds: int) -> None:

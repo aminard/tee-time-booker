@@ -17,7 +17,7 @@ through.
 import asyncio
 import re
 from dataclasses import dataclass, field
-from datetime import date as ddate, datetime, timedelta
+from datetime import date as ddate, datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -103,6 +103,13 @@ async def wait_for_queue_release(
     including any queue metadata we can scrape off the page (status
     timestamp, queue id) so we have a richer dataset to reason about.
 
+    We also attach a response listener to capture Queue-it's spa-api
+    status poll bodies (numeric `progress`, `QueueState`, etc.) as they
+    arrive. These are the only direct measurement of our position-in-queue
+    over time — the page doesn't render position info, but the JSON does.
+    Captured samples flow back in the return dict for the caller to
+    persist.
+
     The 4 h default timeout is deliberately loose. The right frame isn't
     "how long am I willing to sit in the queue" but "how long past the
     booking-open moment am I willing to keep trying to book." Arriving
@@ -123,40 +130,99 @@ async def wait_for_queue_release(
         title=await page.title(),
         **initial_meta,
     )
-    while True:
-        if not is_in_queue(page):
-            wait_seconds = round(loop.time() - start, 1)
-            log.info(
-                "virtual waiting room: released",
-                wait_seconds=wait_seconds,
-                url=page.url,
-            )
-            try:
-                await page.wait_for_load_state("networkidle", timeout=15_000)
-            except Exception:
-                pass
-            return {
-                "wait_sec": wait_seconds,
-                "queue_id": last_meta.get("queue_id") or initial_meta.get("queue_id"),
-                "headline_at_release": last_meta.get("headline"),
-                "headline_at_entry": initial_meta.get("headline"),
-            }
 
-        elapsed = loop.time() - start
-        if elapsed >= timeout_sec:
-            raise RuntimeError(
-                f"virtual waiting room: timed out after {timeout_sec}s (still on {page.url})"
-            )
-        if loop.time() - last_log >= log_interval_sec:
-            last_meta = await _scrape_queue_metadata(page)
-            log.info(
-                "virtual waiting room: still waiting",
-                wait_seconds=round(elapsed, 1),
-                url=page.url,
-                **last_meta,
-            )
-            last_log = loop.time()
-        await asyncio.sleep(poll_interval_sec)
+    # Capture Queue-it status poll responses for the duration of the wait.
+    # The page's own JS polls every ~30 s in Phase 1 (holding) and every
+    # ~2 s in Phase 2 (releasing); each response body carries `progress`
+    # and `QueueState` which are the only signals we get about our actual
+    # position. We listen on the page event and parse bodies as they
+    # arrive, appending to `samples` for later return.
+    samples: list[dict] = []
+
+    async def _capture(response):
+        url = response.url
+        if "spa-api/queue/" not in url or "/status" not in url:
+            return
+        try:
+            body = await response.json()
+        except Exception as e:
+            log.debug("queue status: parse failed", error=str(e))
+            return
+        ticket = body.get("ticket") or {}
+        sample = {
+            "t_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "elapsed_sec": round(loop.time() - start, 2),
+            "phase": body.get("QueueState"),
+            "is_before_or_idle": body.get("isBeforeOrIdle"),
+            "forecast": body.get("forecastStatus"),
+            "progress": ticket.get("progress"),
+            "seconds_to_start": ticket.get("secondsToStart"),
+            "update_interval_ms": body.get("updateInterval"),
+        }
+        samples.append(sample)
+        log.info("queue status sample", **sample)
+
+    def _on_response(response):
+        # page.on() takes a sync callback; spawn a task for the async work.
+        asyncio.create_task(_capture(response))
+
+    page.on("response", _on_response)
+    try:
+        while True:
+            if not is_in_queue(page):
+                wait_seconds = round(loop.time() - start, 1)
+                log.info(
+                    "virtual waiting room: released",
+                    wait_seconds=wait_seconds,
+                    url=page.url,
+                    samples_captured=len(samples),
+                )
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=15_000)
+                except Exception:
+                    pass
+
+                # Derive summary stats from captured samples.
+                phase2 = [s for s in samples if s["phase"] == 2]
+                phase2_start = phase2[0] if phase2 else None
+                phase2_end = phase2[-1] if phase2 else None
+                return {
+                    "wait_sec": wait_seconds,
+                    "queue_id": last_meta.get("queue_id") or initial_meta.get("queue_id"),
+                    "headline_at_release": last_meta.get("headline"),
+                    "headline_at_entry": initial_meta.get("headline"),
+                    "status_samples": samples,
+                    "phase2_start_utc": phase2_start["t_utc"] if phase2_start else None,
+                    "phase2_initial_progress": (
+                        phase2_start["progress"] if phase2_start else None
+                    ),
+                    "phase2_last_progress": (
+                        phase2_end["progress"] if phase2_end else None
+                    ),
+                    "phase2_sample_count": len(phase2),
+                    "phase1_sample_count": sum(1 for s in samples if s["phase"] == 1),
+                }
+
+            elapsed = loop.time() - start
+            if elapsed >= timeout_sec:
+                raise RuntimeError(
+                    f"virtual waiting room: timed out after {timeout_sec}s (still on {page.url})"
+                )
+            if loop.time() - last_log >= log_interval_sec:
+                last_meta = await _scrape_queue_metadata(page)
+                log.info(
+                    "virtual waiting room: still waiting",
+                    wait_seconds=round(elapsed, 1),
+                    url=page.url,
+                    **last_meta,
+                )
+                last_log = loop.time()
+            await asyncio.sleep(poll_interval_sec)
+    finally:
+        try:
+            page.remove_listener("response", _on_response)
+        except Exception:
+            pass
 
 
 @dataclass
@@ -233,8 +299,8 @@ class BookingSession:
         deadline_utc: datetime,
         *,
         interval_sec: int = 90,
-        fast_interval_sec: int | None = None,
-        fast_duration_sec: int = 1200,
+        tight_interval_sec: int | None = None,
+        tight_window_sec: int = 900,
     ) -> None:
         """Refresh splash.html periodically until `deadline_utc`.
 
@@ -244,22 +310,24 @@ class BookingSession:
           (2) Detect virtual-waiting-room activation during the idle period;
               if a refresh lands us in the queue, we wait for release.
 
-        Adaptive cadence: if `fast_interval_sec` is set, the loop uses that
-        tighter interval for the first `fast_duration_sec` seconds (useful
-        for narrowing down when a waiting room first activates), then relaxes
-        to `interval_sec` for the remainder. Pass None (default) to use a
+        Adaptive cadence: if `tight_interval_sec` is set, the loop uses that
+        tighter interval for the last `tight_window_sec` seconds *before
+        deadline_utc*, and `interval_sec` outside that window. This anchors
+        the tight period to the expected activation moment regardless of
+        how long the bot has been running — important when lead time is
+        long (e.g. 60+ min) and a fixed "tight for the first N seconds"
+        window would expire before activation happens. Pass None to use a
         flat `interval_sec` throughout.
 
         `clock` is a tee_time_booker.clock.Clock (offset-corrected NTP wrapper).
         """
         splash_url = f"{self.base_url}/splash.html"
-        start_utc = clock.now_utc()
         log.info(
             "keepalive: starting",
             deadline_utc=deadline_utc.isoformat(),
             interval_sec=interval_sec,
-            fast_interval_sec=fast_interval_sec,
-            fast_duration_sec=fast_duration_sec if fast_interval_sec else None,
+            tight_interval_sec=tight_interval_sec,
+            tight_window_sec=tight_window_sec if tight_interval_sec else None,
         )
         while True:
             now = clock.now_utc()
@@ -267,10 +335,10 @@ class BookingSession:
                 log.info("keepalive: deadline reached")
                 return
 
-            # Pick the active interval based on elapsed time.
-            elapsed_sec = (now - start_utc).total_seconds()
-            if fast_interval_sec is not None and elapsed_sec < fast_duration_sec:
-                active_interval = fast_interval_sec
+            # Pick the active interval based on remaining time to deadline.
+            remaining_sec = (deadline_utc - now).total_seconds()
+            if tight_interval_sec is not None and remaining_sec <= tight_window_sec:
+                active_interval = tight_interval_sec
             else:
                 active_interval = interval_sec
 
