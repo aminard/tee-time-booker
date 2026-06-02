@@ -180,6 +180,9 @@ def plan() -> None:
               help="After the booking finishes, keep the browser window open for "
                    "this many seconds before closing. Useful for real runs where "
                    "you want to inspect the receipt or capture DevTools data.")
+@click.option("--pre-auth", is_flag=True,
+              help="Bake --pre-auth into the armed run: log in early and hold the "
+                   "authenticated session through the queue. Experimental.")
 def schedule(
     plan_path: Path,
     confirm: bool,
@@ -187,6 +190,7 @@ def schedule(
     login_lead_seconds: int,
     watch: bool,
     keep_browser_open_sec: int,
+    pre_auth: bool,
 ) -> None:
     """Generate a launchd plist to run the bot automatically at the plan's booking-open moment.
 
@@ -252,6 +256,7 @@ def schedule(
         if keep_browser_open_sec > 0
         else ""
     )
+    pre_auth_arg = "\n        <string>--pre-auth</string>" if pre_auth else ""
     plist = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -267,7 +272,7 @@ def schedule(
         <string>tee-time-booker</string>
         <string>run</string>
         <string>--login-lead-seconds</string>
-        <string>{login_lead_seconds}</string>{watch_arg}{keep_open_arg}
+        <string>{login_lead_seconds}</string>{watch_arg}{keep_open_arg}{pre_auth_arg}
         <string>{flag}</string>
         <string>{plan_abs}</string>
     </array>
@@ -336,6 +341,10 @@ def schedule(
               help="After the booking pipeline finishes, keep the browser window "
                    "open for this many seconds before closing — lets you inspect "
                    "the receipt page, capture cookies in DevTools, etc.")
+@click.option("--pre-auth", is_flag=True,
+              help="Log in early at site entry and hold the authenticated session "
+                   "through keepalive + the queue, instead of deferring login until "
+                   "just before booking opens. Experimental.")
 def run(
     plan_path: Path,
     dry_run: bool,
@@ -343,6 +352,7 @@ def run(
     login_lead_seconds: int,
     watch_logs: bool,
     keep_browser_open_sec: int,
+    pre_auth: bool,
 ) -> None:
     """Execute a booking run against a plan.
 
@@ -405,6 +415,7 @@ def run(
                     dry_run=not confirm,
                     lead_time_sec=login_lead_seconds,
                     keep_browser_open_sec=keep_browser_open_sec,
+                    pre_auth=pre_auth,
                 )
             )
         except BookingRunError as e:

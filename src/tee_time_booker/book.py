@@ -695,6 +695,7 @@ async def run_scheduled_booking(
     auth_lead_sec: int = 60,
     final_quiet_sec: int = 5,
     keep_browser_open_sec: int = 0,
+    pre_auth: bool = False,
 ) -> BookingResult:
     """Run a booking, waiting until the moment booking opens before firing.
 
@@ -780,20 +781,37 @@ async def run_scheduled_booking(
                 result=result,
             )
 
-    # Long-lead path: enter site unauthenticated, keepalive, then authenticate
-    # just before booking opens.
+    # Long-lead path: enter site, keepalive through activation/queue, then book.
+    #
+    # Two login strategies:
+    #   - Deferred (default): stay anonymous through the keepalive + queue,
+    #     authenticate at T-auth_lead_sec. Original design — minimizes the
+    #     window in which a queue redirect could disturb an authed session.
+    #   - Pre-auth (pre_auth=True): log in immediately at site entry, hold the
+    #     authenticated session through keepalive + the queue, verify it
+    #     survived afterwards (re-auth if not). Removes the login step from the
+    #     post-queue critical path. Experimental — testing whether being
+    #     authenticated before activation changes anything.
     import time as _time
     async with await enter_site(secrets.base_url, headless=headless) as session:
         auth_at = opens_at - timedelta(seconds=auth_lead_sec)
-        now = clock.now_utc()
         t_keepalive_start = _time.monotonic()
+
+        if pre_auth:
+            log.info("pre-auth: authenticating early, before keepalive/queue")
+            await session.authenticate(
+                secrets.username, secrets.password.get_secret_value()
+            )
+
+        now = clock.now_utc()
         if now < auth_at and (auth_at - now).total_seconds() > keepalive_interval_sec:
             wait_s = (auth_at - now).total_seconds()
             log.info(
-                "entered site (unauthenticated); keepalive until auth moment",
+                "keepalive until auth/booking moment",
                 wait_seconds=round(wait_s, 1),
                 interval_sec=keepalive_interval_sec,
                 auth_lead_sec=auth_lead_sec,
+                pre_auth=pre_auth,
             )
             await session.keepalive(
                 clock, auth_at,
@@ -803,14 +821,20 @@ async def run_scheduled_booking(
             )
         result.time_in_keepalive_sec = round(_time.monotonic() - t_keepalive_start, 1)
 
-        # Authenticate.
-        remaining = (auth_at - clock.now_utc()).total_seconds()
-        if remaining > 0:
-            await clock.sleep_until(auth_at)
-        log.info("auth moment reached; logging in")
-        await session.authenticate(
-            secrets.username, secrets.password.get_secret_value()
-        )
+        if pre_auth:
+            # Verify the early login survived the queue passage; recover if not.
+            await session.ensure_authenticated(
+                secrets.username, secrets.password.get_secret_value()
+            )
+        else:
+            # Deferred login: authenticate now, just before booking opens.
+            remaining = (auth_at - clock.now_utc()).total_seconds()
+            if remaining > 0:
+                await clock.sleep_until(auth_at)
+            log.info("auth moment reached; logging in")
+            await session.authenticate(
+                secrets.username, secrets.password.get_secret_value()
+            )
 
         return await _wait_and_book(
             session, plan, secrets, clock, opens_at,

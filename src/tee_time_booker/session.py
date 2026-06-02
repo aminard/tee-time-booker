@@ -441,6 +441,38 @@ class BookingSession:
         self.user_agent = await page.evaluate("navigator.userAgent")
         log.info("authenticate: login succeeded", final_url=final_url)
 
+    async def ensure_authenticated(self, username: str, password: str) -> bool:
+        """Verify we're still logged in and recover if not. Returns True if a
+        (re-)login was performed.
+
+        Used by the pre-auth flow: we authenticate early and hold the session
+        through keepalive + the virtual waiting room, but a redirect through
+        the queue *might* invalidate it. After the queue we land back on
+        splash.html — if it shows the login form, the session was lost and we
+        re-authenticate; otherwise we refresh the CSRF token from the current
+        URL (the early-login token may be stale after a long hold) and proceed.
+        """
+        page = self._page
+        login_form = page.locator('input[name="weblogin_username"]')
+        if await login_form.count() > 0:
+            log.warning(
+                "ensure_authenticated: login form present after queue — "
+                "session lost; re-authenticating",
+                url=page.url,
+            )
+            await self.authenticate(username, password)
+            return True
+
+        token = parse_qs(urlparse(page.url).query).get("_csrf_token", [""])[0]
+        if token:
+            self.csrf_token = token
+        log.info(
+            "ensure_authenticated: session survived the queue; still authenticated",
+            url=page.url,
+            csrf_refreshed=bool(token),
+        )
+        return False
+
     async def _fetch(
         self, url: str, *, body_type: str, fields: dict[str, str]
     ) -> Response:
