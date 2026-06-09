@@ -440,6 +440,7 @@ def run(
             "finished_at": finished_at.isoformat(timespec="seconds"),
             "duration_seconds": round((finished_at - started_at).total_seconds(), 2),
             "target_date": plan.target_date.isoformat(),
+            "search_dates": [d.isoformat() for d in plan.day_order()],
             "plan_path": str(plan_path),
             "mode": "real" if confirm else "dry_run",
             "success": error is None,

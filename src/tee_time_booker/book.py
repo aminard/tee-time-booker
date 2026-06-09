@@ -208,6 +208,79 @@ def rank_slots(
     return sorted(eligible, key=score)
 
 
+def rank_slots_multiday(
+    slots: list[TeeTimeSlot],
+    course_order: list[str],
+    day_order: list,
+    *,
+    preferred_earliest: dtime | None = None,
+    preferred_latest: dtime | None = None,
+    course_downgrade_minutes: int = 25,
+    day_fallback_trigger: str = "preferred",
+) -> list[TeeTimeSlot]:
+    """Rank slots that may span multiple days.
+
+    Within a single day, slots are ranked by the existing `rank_slots`
+    scorer (so the course-vs-time `course_downgrade_minutes` calibration is
+    preserved exactly). Days are then ordered as a hard tier:
+
+      - A day "qualifies" if it has at least one slot in the GATE window.
+      - Gate window is the PREFERRED window when `day_fallback_trigger ==
+        "preferred"` (and a preferred range is set); otherwise the gate is
+        the whole result set, so any day with slots qualifies.
+      - Qualifying days come first, in `day_order` order; non-qualifying
+        days follow, in `day_order` order.
+
+    The returned list concatenates each day's score-ranked slots in that day
+    order. So: preferred day's morning slots first; if the preferred day has
+    no morning slot, the other day's morning slots; and if no day has a
+    morning slot, the preferred day's outer-window slots, then the other's.
+    The downstream claim loop walks this list, so a fully-sniped preferred
+    day naturally falls through to the next.
+
+    A single-day `day_order` reduces exactly to `rank_slots` (one day, one
+    group), leaving single-day behavior unchanged.
+    """
+    from collections import defaultdict
+
+    by_day: dict = defaultdict(list)
+    for s in slots:
+        by_day[s.tee_time.date()].append(s)
+
+    use_preferred_gate = (
+        day_fallback_trigger == "preferred"
+        and preferred_earliest is not None
+        and preferred_latest is not None
+    )
+
+    def in_gate(s: TeeTimeSlot) -> bool:
+        if not use_preferred_gate:
+            return True
+        return preferred_earliest <= s.tee_time.time() <= preferred_latest
+
+    per_day_ranked: dict = {}
+    qualifies: dict = {}
+    for d in day_order:
+        ranked_day = rank_slots(
+            by_day.get(d, []),
+            course_order,
+            preferred_earliest=preferred_earliest,
+            preferred_latest=preferred_latest,
+            course_downgrade_minutes=course_downgrade_minutes,
+        )
+        per_day_ranked[d] = ranked_day
+        qualifies[d] = any(in_gate(s) for s in ranked_day)
+
+    ordered_days = (
+        [d for d in day_order if qualifies[d]]
+        + [d for d in day_order if not qualifies[d]]
+    )
+    out: list[TeeTimeSlot] = []
+    for d in ordered_days:
+        out.extend(per_day_ranked[d])
+    return out
+
+
 def pick_best_slot(
     slots: list[TeeTimeSlot], course_order: list[str]
 ) -> TeeTimeSlot | None:
@@ -563,31 +636,46 @@ async def run_booking(
     if result is None:
         result = BookingResult(dry_run=dry_run)
 
-    slots, total_found, csrf = await with_retry(
-        lambda: search(
-            session,
-            target_date=plan.target_date,
-            earliest_time=plan.earliest_time,
-            latest_time=plan.latest_time,
-            num_players=plan.num_players,
-            num_holes=plan.holes,
-        ),
-        label="search",
-    )
+    # Search each target day (preferred first), pooling the results. Both
+    # days of a weekend open at the same moment, so one run can chase both.
+    # Each search is one extra round-trip on the critical path; accepted as
+    # the cost of not being blind to the other day's morning inventory.
+    day_order = plan.day_order()
+    slots: list[TeeTimeSlot] = []
+    total_found = 0
+    csrf = session.csrf_token
+    for d in day_order:
+        day_slots, day_total, csrf = await with_retry(
+            lambda d=d: search(
+                session,
+                target_date=d,
+                earliest_time=plan.earliest_time,
+                latest_time=plan.latest_time,
+                num_players=plan.num_players,
+                num_holes=plan.holes,
+            ),
+            label=f"search[{d.isoformat()}]",
+        )
+        slots.extend(day_slots)
+        total_found += day_total
     result.steps_completed.append("search")
     result.slots_total_found = total_found
     result.slots_in_window = len(slots)
     if not slots:
         raise RuntimeError("run_booking: no slots in window")
 
-    ranked = rank_slots(
+    ranked = rank_slots_multiday(
         slots,
         plan.courses_ranked(),
+        day_order,
         preferred_earliest=plan.preferred_earliest,
         preferred_latest=plan.preferred_latest,
         course_downgrade_minutes=plan.course_downgrade_minutes,
+        day_fallback_trigger=plan.day_fallback_trigger,
     )
-    result.ranked_top = [(s.course, s.tee_time.strftime("%I:%M %p")) for s in ranked[:5]]
+    result.ranked_top = [
+        (s.course, s.tee_time.strftime("%a %m/%d %I:%M %p")) for s in ranked[:5]
+    ]
     if not ranked:
         raise RuntimeError("run_booking: no slots match preferred courses")
     log.info(
@@ -726,12 +814,28 @@ async def run_scheduled_booking(
     from tee_time_booker.session import enter_site, login
 
     opens_at = compute_booking_opens_at(plan.target_date)
+
+    # Multi-day guard: every target day must open at the same moment, or a
+    # single timed run can't serve them. (Sat+Sun of a weekend do; pairing a
+    # Saturday with a weekday would not.)
+    opens_by_day = {d: compute_booking_opens_at(d) for d in plan.day_order()}
+    distinct = set(opens_by_day.values())
+    if len(distinct) > 1:
+        detail = ", ".join(
+            f"{d.isoformat()}→{o.isoformat()}" for d, o in opens_by_day.items()
+        )
+        raise ValueError(
+            "all target dates must open at the same booking moment for one run; "
+            f"got differing moments: {detail}"
+        )
+
     clock = await sync_clock()
     now = clock.now_utc()
 
     log.info(
         "scheduled run",
         target_date=plan.target_date.isoformat(),
+        search_dates=[d.isoformat() for d in plan.day_order()],
         opens_at_utc=opens_at.isoformat(),
         now_utc=now.isoformat(),
         offset_ms=clock.offset_seconds * 1000,

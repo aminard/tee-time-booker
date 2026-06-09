@@ -56,6 +56,23 @@ class Plan(BaseModel):
     # long as it's within ~25 min of preferred.
     course_downgrade_minutes: int = Field(default=25, ge=0)
 
+    # --- Multi-day support ---
+    # Extra day(s) to also search in the same run. Both days of a weekend
+    # open at the same Monday 8 PM moment, so one run can chase both. Slots
+    # from all days are pooled and ranked together.
+    additional_dates: list[date] = Field(default_factory=list)
+    # Which day wins when more than one has qualifying slots. Defaults to
+    # target_date. Must be one of the target dates.
+    preferred_day: date | None = None
+    # What triggers falling back to a non-preferred day:
+    #   "preferred" — jump to another day if the preferred day has no slot in
+    #                 the PREFERRED window (8:30-10:30 etc.). "I'd rather a
+    #                 morning on the other day than a late slot on this one."
+    #   "outer"     — only jump if the preferred day has no slot at all in the
+    #                 outer window. "Stay on my day unless it's totally empty."
+    # Switchable per weekend via the plan file; no code change needed to flip.
+    day_fallback_trigger: str = "preferred"
+
     @model_validator(mode="after")
     def _validate_preferred_range(self) -> "Plan":
         if (self.preferred_earliest is None) != (self.preferred_latest is None):
@@ -82,12 +99,41 @@ class Plan(BaseModel):
                 )
         return self
 
+    @model_validator(mode="after")
+    def _validate_multiday(self) -> "Plan":
+        if self.day_fallback_trigger not in ("preferred", "outer"):
+            raise ValueError(
+                f"day_fallback_trigger must be 'preferred' or 'outer', "
+                f"got {self.day_fallback_trigger!r}"
+            )
+        dates = self.all_dates()
+        if self.preferred_day is not None and self.preferred_day not in dates:
+            raise ValueError(
+                f"preferred_day ({self.preferred_day}) must be one of the "
+                f"target dates {dates}"
+            )
+        return self
+
     def courses_ranked(self) -> list[str]:
         if self.preferred_course_order is None:
             return self.courses
         ranked = [c for c in self.preferred_course_order if c in self.courses]
         ranked += [c for c in self.courses if c not in ranked]
         return ranked
+
+    def all_dates(self) -> list[date]:
+        """All dates to search, deduped, target_date first."""
+        out = [self.target_date]
+        for d in self.additional_dates:
+            if d not in out:
+                out.append(d)
+        return out
+
+    def day_order(self) -> list[date]:
+        """Search/ranking day order — preferred day first, then the rest."""
+        dates = self.all_dates()
+        pref = self.preferred_day or self.target_date
+        return [pref] + [d for d in dates if d != pref]
 
 
 def load_plan(path: Path) -> Plan:
