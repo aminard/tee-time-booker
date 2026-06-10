@@ -638,30 +638,51 @@ async def run_booking(
 
     # Search each target day (preferred first), pooling the results. Both
     # days of a weekend open at the same moment, so one run can chase both.
-    # Each search is one extra round-trip on the critical path; accepted as
-    # the cost of not being blind to the other day's morning inventory.
+    # Searches fire CONCURRENTLY (in-page fetch, not page navigation), so
+    # the multi-day cost is "slowest single search", not the sum. If the
+    # parallel burst fails — e.g. the platform rotates the CSRF token on
+    # one response and rejects the other — fall back to sequential with
+    # token threading, which can't trip over its own rotation.
     day_order = plan.day_order()
-    slots: list[TeeTimeSlot] = []
-    total_found = 0
     csrf = session.csrf_token
-    for d in day_order:
-        # Thread the freshest CSRF into each search — the platform
-        # occasionally rotates it per response (seen live 2026-06-08),
-        # so day 2 must not reuse the login-era token.
-        day_slots, day_total, csrf = await with_retry(
-            lambda d=d: search(
+
+    async def _search_day(d, token: str):
+        return await with_retry(
+            lambda: search(
                 session,
                 target_date=d,
                 earliest_time=plan.earliest_time,
                 latest_time=plan.latest_time,
                 num_players=plan.num_players,
                 num_holes=plan.holes,
-                csrf_token=csrf,
+                csrf_token=token,
             ),
             label=f"search[{d.isoformat()}]",
         )
+
+    try:
+        day_results = list(
+            await asyncio.gather(*(_search_day(d, csrf) for d in day_order))
+        )
+    except Exception as e:
+        log.warning("parallel search failed; retrying sequentially", error=str(e))
+        day_results = []
+        for d in day_order:
+            r = await _search_day(d, csrf)
+            csrf = r[2]
+            day_results.append(r)
+
+    slots: list[TeeTimeSlot] = []
+    total_found = 0
+    initial_csrf = session.csrf_token
+    for day_slots, day_total, fresh in day_results:
         slots.extend(day_slots)
         total_found += day_total
+        # Adopt any rotated token. Compare against the ORIGINAL token, not
+        # the running value — otherwise a day-2 response that didn't rotate
+        # would clobber day-1's rotated token with the stale original.
+        if fresh and fresh != initial_csrf:
+            csrf = fresh
     result.steps_completed.append("search")
     result.slots_total_found = total_found
     result.slots_in_window = len(slots)

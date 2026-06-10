@@ -90,7 +90,9 @@ async def search(
         num_holes=num_holes,
     )
     log.info("fetching search results", url=url)
-    resp = await session.get(url)
+    # In-page fetch (not a page navigation): skips the networkidle settle
+    # wait, and lets multi-day searches run concurrently.
+    resp = await session.get_fetch(url)
     if not resp.ok:
         raise RuntimeError(f"search: HTTP {resp.status}")
 

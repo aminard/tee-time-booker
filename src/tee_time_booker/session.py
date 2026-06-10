@@ -285,6 +285,13 @@ class BookingSession:
             text=await self._page.content(),
         )
 
+    async def get_fetch(self, url: str) -> Response:
+        """GET via in-page fetch() — same browser network stack as `get()`,
+        but no page navigation. Two advantages on the hot path: no
+        networkidle settle-wait, and multiple GETs can run concurrently
+        (page.goto is inherently one-at-a-time). Used for searches."""
+        return await self._fetch(url, body_type=None, fields=None)
+
     async def post_multipart(self, url: str, fields: dict[str, str]) -> Response:
         """Submit a multipart/form-data POST via in-page fetch()."""
         return await self._fetch(url, body_type="multipart", fields=fields)
@@ -474,26 +481,26 @@ class BookingSession:
         return False
 
     async def _fetch(
-        self, url: str, *, body_type: str, fields: dict[str, str]
+        self, url: str, *, body_type: str | None, fields: dict[str, str] | None
     ) -> Response:
         """Run fetch() from the live page's JS context so it uses the real
-        browser network stack. Returns status, final URL, and body text."""
+        browser network stack. `body_type=None` means a plain GET.
+        Returns status, final URL, and body text."""
         js = r"""
         async ({url, bodyType, fields}) => {
-            let body;
-            if (bodyType === 'multipart') {
-                body = new FormData();
-                for (const [k, v] of Object.entries(fields)) body.append(k, v);
+            const opts = {redirect: 'follow', credentials: 'include'};
+            if (bodyType === null) {
+                opts.method = 'GET';
             } else {
-                body = new URLSearchParams();
-                for (const [k, v] of Object.entries(fields)) body.append(k, v);
+                opts.method = 'POST';
+                if (bodyType === 'multipart') {
+                    opts.body = new FormData();
+                } else {
+                    opts.body = new URLSearchParams();
+                }
+                for (const [k, v] of Object.entries(fields)) opts.body.append(k, v);
             }
-            const resp = await fetch(url, {
-                method: 'POST',
-                body,
-                redirect: 'follow',
-                credentials: 'include',
-            });
+            const resp = await fetch(url, opts);
             return {
                 status: resp.status,
                 url: resp.url,
