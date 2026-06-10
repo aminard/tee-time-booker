@@ -462,6 +462,7 @@ def run(
             # Search context
             "slots_total_found": result.slots_total_found if result else None,
             "slots_in_window": result.slots_in_window if result else None,
+            "search_rounds": result.search_rounds if result else None,
             "ranked_top": (
                 [{"course": c, "time": t} for c, t in result.ranked_top]
                 if result and result.ranked_top
@@ -515,6 +516,7 @@ def run(
                 "confirmation_numbers",
                 "slots_total_found",
                 "slots_in_window",
+                "search_rounds",
                 "queue_encountered",
                 "queue_wait_sec",
                 "queue_phase2_initial_progress",

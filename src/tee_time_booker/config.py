@@ -57,6 +57,13 @@ class Plan(BaseModel):
     # behavior). Calibrated default 25 keeps the user's top course as
     # long as it's within ~25 min of preferred.
     course_downgrade_minutes: int = Field(default=25, ge=0)
+    # How long to keep re-searching + re-claiming after a round comes up
+    # empty (sold out, or every claim sniped by faster competitors).
+    # Slots reappear as other people's 15-min carts expire, so persisting
+    # converts "lost the sprint" into "caught the cancellation". Patience-0
+    # semantics: the FIRST grabbable slot ends the stakeout — the bot never
+    # holds out hoping something better shows up. 0 = single attempt.
+    stakeout_minutes: int = Field(default=15, ge=0)
 
     # --- Multi-day support ---
     # Extra day(s) to also search in the same run. Both days of a weekend

@@ -122,6 +122,9 @@ class BookingResult:
     slots_total_found: int | None = None
     slots_in_window: int | None = None
     ranked_top: list[tuple[str, str]] = field(default_factory=list)  # [(course, "12:00 PM"), ...]
+    # Stakeout context — how many search→claim rounds ran. 1 = booked (or
+    # died) on the first attempt; >1 means the loop persisted.
+    search_rounds: int | None = None
 
     # Queue context — populated by wait_for_queue_release (whether triggered
     # from enter_site or mid-keepalive). None if the run never touched the queue.
@@ -660,62 +663,107 @@ async def run_booking(
             label=f"search[{d.isoformat()}]",
         )
 
-    try:
-        day_results = list(
-            await asyncio.gather(*(_search_day(d, csrf) for d in day_order))
+    async def _search_and_rank() -> list[TeeTimeSlot]:
+        """One round: search all days concurrently, pool, rank. Raises if
+        nothing is grabbable. Updates `csrf` and the result's search
+        diagnostics (latest round's snapshot wins)."""
+        nonlocal csrf
+        try:
+            day_results = list(
+                await asyncio.gather(*(_search_day(d, csrf) for d in day_order))
+            )
+        except Exception as e:
+            log.warning("parallel search failed; retrying sequentially", error=str(e))
+            day_results = []
+            for d in day_order:
+                r = await _search_day(d, csrf)
+                csrf = r[2]
+                day_results.append(r)
+
+        slots: list[TeeTimeSlot] = []
+        total_found = 0
+        initial_csrf = session.csrf_token
+        for day_slots, day_total, fresh in day_results:
+            slots.extend(day_slots)
+            total_found += day_total
+            # Adopt any rotated token. Compare against the ORIGINAL token,
+            # not the running value — otherwise a day-2 response that didn't
+            # rotate would clobber day-1's rotated token with the stale
+            # original.
+            if fresh and fresh != initial_csrf:
+                csrf = fresh
+        result.slots_total_found = total_found
+        result.slots_in_window = len(slots)
+        if "search" not in result.steps_completed:
+            result.steps_completed.append("search")
+        if not slots:
+            raise RuntimeError("run_booking: no slots in window")
+
+        ranked = rank_slots_multiday(
+            slots,
+            plan.courses_ranked(),
+            day_order,
+            preferred_earliest=plan.preferred_earliest,
+            preferred_latest=plan.preferred_latest,
+            course_downgrade_minutes=plan.course_downgrade_minutes,
+            day_fallback_trigger=plan.day_fallback_trigger,
         )
-    except Exception as e:
-        log.warning("parallel search failed; retrying sequentially", error=str(e))
-        day_results = []
-        for d in day_order:
-            r = await _search_day(d, csrf)
-            csrf = r[2]
-            day_results.append(r)
+        result.ranked_top = [
+            (s.course, s.tee_time.strftime("%a %m/%d %I:%M %p")) for s in ranked[:5]
+        ]
+        if not ranked:
+            raise RuntimeError("run_booking: no slots match preferred courses")
+        log.info(
+            "run_booking: ranked candidates",
+            count=len(ranked),
+            top=result.ranked_top,
+        )
+        return ranked
 
-    slots: list[TeeTimeSlot] = []
-    total_found = 0
-    initial_csrf = session.csrf_token
-    for day_slots, day_total, fresh in day_results:
-        slots.extend(day_slots)
-        total_found += day_total
-        # Adopt any rotated token. Compare against the ORIGINAL token, not
-        # the running value — otherwise a day-2 response that didn't rotate
-        # would clobber day-1's rotated token with the stale original.
-        if fresh and fresh != initial_csrf:
-            csrf = fresh
-    result.steps_completed.append("search")
-    result.slots_total_found = total_found
-    result.slots_in_window = len(slots)
-    if not slots:
-        raise RuntimeError("run_booking: no slots in window")
+    # Stakeout loop: search → claim, repeating until something lands or the
+    # budget runs out. Slots reappear after the open as competitors' 15-min
+    # carts expire and fumbled checkouts release inventory, so a failed
+    # sprint becomes a watch. Patience-0: the first round with ANY grabbable
+    # slot books it (per ranking) — the loop only spins when a round secured
+    # nothing. Once a claim lands, the pipeline proceeds and never re-enters
+    # the loop, so a double-claim is impossible. Pacing mirrors how slots
+    # actually reappear: every ~5s while cart-expiry churn is hottest, easing
+    # to ~25s after the first couple of minutes. stakeout_minutes=0 keeps the
+    # legacy single-shot behavior.
+    import time as _time
 
-    ranked = rank_slots_multiday(
-        slots,
-        plan.courses_ranked(),
-        day_order,
-        preferred_earliest=plan.preferred_earliest,
-        preferred_latest=plan.preferred_latest,
-        course_downgrade_minutes=plan.course_downgrade_minutes,
-        day_fallback_trigger=plan.day_fallback_trigger,
-    )
-    result.ranked_top = [
-        (s.course, s.tee_time.strftime("%a %m/%d %I:%M %p")) for s in ranked[:5]
-    ]
-    if not ranked:
-        raise RuntimeError("run_booking: no slots match preferred courses")
-    log.info(
-        "run_booking: ranked candidates",
-        count=len(ranked),
-        top=result.ranked_top,
-    )
+    budget_sec = getattr(plan, "stakeout_minutes", 0) * 60
+    t0 = _time.monotonic()
+    round_num = 0
+    while True:
+        round_num += 1
+        result.search_rounds = round_num
+        try:
+            ranked = await _search_and_rank()
+            chosen, claim_html = await _claim_first_available(
+                session, csrf, ranked, plan.num_players,
+                max_attempts=min(5, len(ranked)),
+            )
+            break
+        except Exception as e:
+            elapsed = _time.monotonic() - t0
+            if elapsed >= budget_sec:
+                if round_num == 1:
+                    raise  # no stakeout configured/possible — original error
+                raise RuntimeError(
+                    f"run_booking: stakeout budget exhausted after {round_num} "
+                    f"rounds over {round(elapsed / 60, 1)} min; last error: {e}"
+                ) from e
+            pause = 5 if elapsed < 120 else 25
+            log.warning(
+                "stakeout: round came up empty; holding position",
+                round=round_num,
+                error=str(e),
+                retry_in_sec=pause,
+                budget_remaining_sec=round(budget_sec - elapsed),
+            )
+            await asyncio.sleep(pause)
 
-    # Try slots in preference order. First one whose claim lands a player-
-    # selection form wins. If top pick is grabbed by a competing bot, fall
-    # through to the next — the search already filtered by time window, so
-    # every option here is acceptable.
-    chosen, claim_html = await _claim_first_available(
-        session, csrf, ranked, plan.num_players, max_attempts=min(5, len(ranked))
-    )
     result.slot = chosen
     result.steps_completed.append("claim")
     csrf = _scrape_csrf(claim_html) or csrf
