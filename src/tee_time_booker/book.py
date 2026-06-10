@@ -122,6 +122,11 @@ class BookingResult:
     slots_total_found: int | None = None
     slots_in_window: int | None = None
     ranked_top: list[tuple[str, str]] = field(default_factory=list)  # [(course, "12:00 PM"), ...]
+    # Every in-window slot from the (latest) search round, as plain dicts —
+    # full inventory context for post-hoc analysis (course intervals, what
+    # was available vs. what we picked, GRFMID comparison for the
+    # pre-search experiment).
+    all_slots: list[dict] = field(default_factory=list)
     # Stakeout context — how many search→claim rounds ran. 1 = booked (or
     # died) on the first attempt; >1 means the loop persisted.
     search_rounds: int | None = None
@@ -153,6 +158,16 @@ class BookingResult:
     # Timing breakdown — split out so we can see where the time went.
     time_in_keepalive_sec: float | None = None
     time_in_pipeline_sec: float | None = None
+
+
+def _slot_as_dict(s: TeeTimeSlot) -> dict:
+    """Serialize a slot for result JSON / snapshot files."""
+    return {
+        "course": s.course,
+        "tee_time": s.tee_time.isoformat(),
+        "grfmid": s.grfmid,
+        "max_players": s.num_players_allowed,
+    }
 
 
 def _course_slug(display_name: str) -> str:
@@ -686,6 +701,7 @@ async def run_booking(
                 csrf = fresh
         result.slots_total_found = total_found
         result.slots_in_window = len(slots)
+        result.all_slots = [_slot_as_dict(s) for s in slots]
         if "search" not in result.steps_completed:
             result.steps_completed.append("search")
         if not slots:

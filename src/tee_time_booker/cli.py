@@ -528,6 +528,9 @@ def run(
                 if result and result.ranked_top
                 else []
             ),
+            # Full in-window inventory from the last search round (kept out
+            # of the one-line registry — result JSON only).
+            "all_slots": result.all_slots if result else [],
 
             # Queue context
             "queue_encountered": result.queue_encountered if result else False,
@@ -630,6 +633,91 @@ def run(
         sys.stdout = original_stdout
         sys.stderr = original_stderr
         log_file.close()
+
+
+@cli.command()
+@click.argument("plan_path", type=click.Path(exists=True, path_type=Path))
+def snapshot(plan_path: Path) -> None:
+    """Capture the current tee sheet for a plan's target dates.
+
+    Logs in, searches every day the plan targets (full outer window), and
+    writes the complete slot list — course, time, GRFMID — to
+    logs/{ts}-snapshot.json. No claims, no cart, nothing held.
+
+    Built for the pre-search experiment: run this shortly BEFORE booking
+    opens (e.g. 7:40 PM on a weekend-open Monday, before the waiting room
+    activates), then compare GRFMIDs against the post-open run's
+    `all_slots` in its result JSON. If the IDs are stable across the open
+    moment, the bot can pre-build its claim list and skip the post-queue
+    search entirely.
+    """
+    import asyncio
+    import json
+    from datetime import datetime
+
+    from dotenv import load_dotenv
+
+    import structlog
+    from tee_time_booker.book import _slot_as_dict
+    from tee_time_booker.config import Secrets
+    from tee_time_booker.constants import CENTRAL
+    from tee_time_booker.search import search
+    from tee_time_booker.session import login
+
+    structlog.configure(
+        processors=[
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.dev.ConsoleRenderer(),
+        ],
+    )
+
+    plan = _load_plan_or_die(plan_path)
+    load_dotenv()
+    secrets = Secrets()  # type: ignore[call-arg]
+
+    async def _go() -> dict:
+        async with await login(
+            secrets.username,
+            secrets.password.get_secret_value(),
+            secrets.base_url,
+        ) as session:
+            csrf = session.csrf_token
+            by_day: dict = {}
+            for d in plan.day_order():
+                slots, total, csrf = await search(
+                    session,
+                    target_date=d,
+                    earliest_time=plan.earliest_time,
+                    latest_time=plan.latest_time,
+                    num_players=plan.num_players,
+                    num_holes=plan.holes,
+                    csrf_token=csrf,
+                )
+                by_day[d.isoformat()] = {
+                    "total_found": total,
+                    "in_window": [_slot_as_dict(s) for s in slots],
+                }
+            return by_day
+
+    by_day = asyncio.run(_go())
+
+    logs_dir = Path("logs")
+    logs_dir.mkdir(exist_ok=True)
+    captured_at = datetime.now(tz=CENTRAL)
+    out_path = logs_dir / f"{captured_at.strftime('%Y-%m-%dT%H%M%S')}-snapshot.json"
+    out_path.write_text(json.dumps({
+        "kind": "snapshot",
+        "captured_at": captured_at.isoformat(timespec="seconds"),
+        "plan_path": str(plan_path),
+        "num_players": plan.num_players,
+        "window": f"{plan.earliest_time}-{plan.latest_time}",
+        "days": by_day,
+    }, indent=2))
+
+    click.echo()
+    for day, data in by_day.items():
+        click.echo(f"{day}: {len(data['in_window'])} slots in window ({data['total_found']} total)")
+    click.echo(f"\nSnapshot written: {out_path.resolve()}")
 
 
 @cli.command()
