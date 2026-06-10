@@ -66,18 +66,24 @@ async def search(
     latest_time: time,
     num_players: int,
     num_holes: int,
+    csrf_token: str | None = None,
     debug_dump: Path | None = None,
 ) -> tuple[list[TeeTimeSlot], int, str]:
     """Fetch + parse search results.
+
+    `csrf_token` lets the caller thread a fresher token than the session's
+    login-era one (the platform occasionally rotates it per response —
+    observed live on 2026-06-08). Falls back to session.csrf_token.
 
     Returns (slots_in_window, total_found, fresh_csrf_token):
       - slots_in_window: parsed slots whose tee_time is <= latest_time
       - total_found:    parsed slots before the time-window filter (diagnostic)
       - fresh_csrf:     csrf_token scraped from the response (may have rotated)
     """
+    token = csrf_token or session.csrf_token
     url = build_search_url(
         session.base_url,
-        session.csrf_token,
+        token,
         target_date=target_date,
         earliest_time=earliest_time,
         num_players=num_players,
@@ -95,13 +101,13 @@ async def search(
 
     all_slots = _parse_results(html, target_date=target_date, num_holes=num_holes)
     in_window = [s for s in all_slots if s.tee_time.time() <= latest_time]
-    fresh_csrf = _scrape_csrf(html) or session.csrf_token
+    fresh_csrf = _scrape_csrf(html) or token
 
     log.info(
         "search parsed",
         total_found=len(all_slots),
         in_time_window=len(in_window),
-        fresh_csrf_differs=(fresh_csrf != session.csrf_token),
+        fresh_csrf_differs=(fresh_csrf != token),
     )
     return in_window, len(all_slots), fresh_csrf
 

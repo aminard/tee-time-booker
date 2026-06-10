@@ -645,6 +645,9 @@ async def run_booking(
     total_found = 0
     csrf = session.csrf_token
     for d in day_order:
+        # Thread the freshest CSRF into each search — the platform
+        # occasionally rotates it per response (seen live 2026-06-08),
+        # so day 2 must not reuse the login-era token.
         day_slots, day_total, csrf = await with_retry(
             lambda d=d: search(
                 session,
@@ -653,6 +656,7 @@ async def run_booking(
                 latest_time=plan.latest_time,
                 num_players=plan.num_players,
                 num_holes=plan.holes,
+                csrf_token=csrf,
             ),
             label=f"search[{d.isoformat()}]",
         )
