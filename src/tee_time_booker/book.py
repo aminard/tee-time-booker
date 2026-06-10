@@ -284,14 +284,6 @@ def rank_slots_multiday(
     return out
 
 
-def pick_best_slot(
-    slots: list[TeeTimeSlot], course_order: list[str]
-) -> TeeTimeSlot | None:
-    """Convenience: top-ranked slot, or None if none match."""
-    ranked = rank_slots(slots, course_order)
-    return ranked[0] if ranked else None
-
-
 def _claim_succeeded(claim_html: str) -> bool:
     """True if the claim response shows the player-selection form — i.e., the
     slot was actually added to the cart. If the server rejected the claim

@@ -170,9 +170,16 @@ async def wait_for_queue_release(
         samples.append(sample)
         log.info("queue status sample", **sample)
 
+    # Hold references to in-flight capture tasks — asyncio only keeps weak
+    # refs to tasks, so an unreferenced task can be garbage-collected
+    # mid-flight and silently drop a sample.
+    capture_tasks: set[asyncio.Task] = set()
+
     def _on_response(response):
         # page.on() takes a sync callback; spawn a task for the async work.
-        asyncio.create_task(_capture(response))
+        t = asyncio.create_task(_capture(response))
+        capture_tasks.add(t)
+        t.add_done_callback(capture_tasks.discard)
 
     page.on("response", _on_response)
     try:
