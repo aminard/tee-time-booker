@@ -4,6 +4,8 @@ from pathlib import Path
 from pydantic import BaseModel, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from tee_time_booker.constants import COURSES
+
 
 class Secrets(BaseSettings):
     """Credentials and PII, loaded from .env (gitignored)."""
@@ -72,6 +74,18 @@ class Plan(BaseModel):
     #                 outer window. "Stay on my day unless it's totally empty."
     # Switchable per weekend via the plan file; no code change needed to flip.
     day_fallback_trigger: str = "preferred"
+
+    @model_validator(mode="after")
+    def _validate_courses(self) -> "Plan":
+        # A typo'd slug would otherwise fail silently: rank_slots just
+        # excludes courses it doesn't recognize, and you'd find out at
+        # 8:00 PM Monday via "no slots match preferred courses".
+        for c in self.courses + (self.preferred_course_order or []):
+            if c not in COURSES:
+                raise ValueError(
+                    f"unknown course {c!r} — valid slugs: {sorted(COURSES)}"
+                )
+        return self
 
     @model_validator(mode="after")
     def _validate_preferred_range(self) -> "Plan":
