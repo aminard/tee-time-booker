@@ -275,9 +275,17 @@ class BookingSession:
         finally:
             await self._pw_mgr.__aexit__(None, None, None)
 
-    async def get(self, url: str) -> Response:
-        """Navigate the live page to `url` and return the final status + HTML."""
-        response = await self._page.goto(url, wait_until="networkidle")
+    async def get(self, url: str, *, wait_until: str = "domcontentloaded") -> Response:
+        """Navigate the live page to `url` and return the final status + HTML.
+
+        Default waits only for domcontentloaded: WebTrac pages are fully
+        server-rendered, so the HTML we parse (forms, hidden fields, CSRF)
+        is complete as soon as the document arrives. The old networkidle
+        default added a ≥500 ms "no traffic for half a second" settle tax
+        per navigation — ~6 navigations on the booking hot path — waiting
+        on images/analytics we never read. Pass wait_until="networkidle"
+        explicitly if a future call ever needs JS to finish."""
+        response = await self._page.goto(url, wait_until=wait_until)
         status = response.status if response else 0
         return Response(
             status=status,
