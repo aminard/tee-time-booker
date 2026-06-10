@@ -108,6 +108,27 @@ def _load_plan_or_die(plan_path: Path):
         raise click.ClickException(f"{plan_path} is not valid YAML:\n{e}") from e
 
 
+def _resolve_login_lead(login_lead_seconds: int | None, plan) -> int:
+    """Default the login lead to the booking-open type when not given.
+
+    Weekend targets open via the Monday-8-PM virtual waiting room, which
+    requires arriving early (30 min lead); weekday targets open with no
+    waiting room (30 s suffices). Until 2026-06-09 this defaulted to 30
+    flat and the user had to remember `--login-lead-seconds 1800` for
+    weekend runs — a silent footgun if forgotten. An explicit flag still
+    wins (experiments may want other values).
+    """
+    if login_lead_seconds is not None:
+        return login_lead_seconds
+    is_weekend = plan.target_date.weekday() >= 5
+    resolved = 1800 if is_weekend else 30
+    click.echo(
+        f"Login lead auto-set to {resolved}s "
+        f"({'weekend open — waiting-room lead' if is_weekend else 'weekday open'})"
+    )
+    return resolved
+
+
 def _cleanup_spent_plists(*, dry_run: bool, verbose: bool) -> tuple[int, int]:
     """Scan ~/Library/LaunchAgents/ for spent tee-time-booker plists and
     unload + remove them. "Spent" = the plist's target booking-open moment
@@ -198,11 +219,14 @@ def plan() -> None:
 @click.option("--lead-minutes", type=int, default=None, show_default="auto",
               help="Minutes before booking opens to launch the bot process (buffers launchd jitter + Python startup). "
                    "Auto-sized to login-lead-seconds + 2 min if omitted.")
-@click.option("--login-lead-seconds", type=int, default=30, show_default=True,
+@click.option("--login-lead-seconds", type=int, default=None,
+              show_default="auto: 1800 weekend / 30 weekday",
               help="Seconds before booking opens to start the bot's site session. "
                    "For long leads (>60s), the bot enters the site and idles through "
-                   "any waiting room, then authenticates ~60s before opening. Use a "
-                   "large value (e.g. 3600 = 60 min) for weekend opens.")
+                   "any waiting room, then authenticates ~60s before opening. "
+                   "Auto-sized from the plan's target day if omitted: weekend opens "
+                   "route through the waiting room (1800 = 30 min lead), weekday "
+                   "opens don't (30 s).")
 @click.option("--watch/--no-watch", default=True, show_default=True,
               help="When the armed run fires, auto-open Terminal tabs tailing the "
                    "stdout and stderr logs. Only effective on macOS.")
@@ -217,7 +241,7 @@ def schedule(
     plan_path: Path,
     confirm: bool,
     lead_minutes: int | None,
-    login_lead_seconds: int,
+    login_lead_seconds: int | None,
     watch: bool,
     keep_browser_open_sec: int,
     pre_auth: bool,
@@ -245,6 +269,9 @@ def schedule(
         click.echo(f"(auto-cleanup: removed {cleaned} spent plist{'s' if cleaned != 1 else ''})")
         click.echo()
 
+    plan = _load_plan_or_die(plan_path)
+    login_lead_seconds = _resolve_login_lead(login_lead_seconds, plan)
+
     # Auto-size launchd firing lead = login_lead + 2 min buffer for Python startup + NTP.
     if lead_minutes is None:
         lead_minutes = max(3, (login_lead_seconds + 119) // 60 + 2)
@@ -255,7 +282,6 @@ def schedule(
             f"({login_lead_seconds}) plus startup buffer."
         )
 
-    plan = _load_plan_or_die(plan_path)
     opens_at_utc = compute_booking_opens_at(plan.target_date)
     fire_at_utc = opens_at_utc - timedelta(minutes=lead_minutes)
     fire_at_local = fire_at_utc.astimezone()
@@ -357,11 +383,12 @@ def schedule(
 @click.argument("plan_path", type=click.Path(exists=True, path_type=Path))
 @click.option("--dry-run", is_flag=True, help="Run full flow but stop before the binding POST.")
 @click.option("--confirm", is_flag=True, help="Required for a real booking (no-op without it).")
-@click.option("--login-lead-seconds", type=int, default=30, show_default=True,
+@click.option("--login-lead-seconds", type=int, default=None,
+              show_default="auto: 1800 weekend / 30 weekday",
               help="Seconds before booking opens to start the bot's site session. "
                    "For long leads (>60s), login is deferred and fires "
-                   "~60s before T=0. Use a large value (e.g. 3600) for opens "
-                   "that route through a virtual waiting room.")
+                   "~60s before T=0. Auto-sized from the plan's target day "
+                   "if omitted (weekend opens route through a waiting room).")
 @click.option("--watch-logs", is_flag=True,
               help="Open Terminal tabs tailing stdout/stderr as soon as this run "
                    "starts. Intended to be baked into launchd-armed runs via "
@@ -378,7 +405,7 @@ def run(
     plan_path: Path,
     dry_run: bool,
     confirm: bool,
-    login_lead_seconds: int,
+    login_lead_seconds: int | None,
     watch_logs: bool,
     keep_browser_open_sec: int,
     pre_auth: bool,
@@ -408,6 +435,7 @@ def run(
     # Validate the plan before any logging machinery spins up — a typo'd
     # plan file should produce one clean error, not an empty run log.
     plan = _load_plan_or_die(plan_path)
+    login_lead_seconds = _resolve_login_lead(login_lead_seconds, plan)
 
     logs_dir = Path("logs")
     logs_dir.mkdir(exist_ok=True)
