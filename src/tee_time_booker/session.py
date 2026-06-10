@@ -22,7 +22,13 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import structlog
-from playwright.async_api import Browser, BrowserContext, Page, async_playwright
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    TimeoutError as PlaywrightTimeoutError,
+    async_playwright,
+)
 
 log = structlog.get_logger()
 
@@ -91,17 +97,20 @@ async def _scrape_queue_metadata(page: Page) -> dict[str, str]:
 async def wait_for_queue_release(
     page: Page,
     *,
-    poll_interval_sec: float = 2.0,
     log_interval_sec: float = 30.0,
     timeout_sec: int = 14400,
 ) -> dict:
     """Block until the page navigates out of the virtual waiting room.
 
     The waiting room JS polls its own status endpoint and triggers a full
-    redirect back to the target URL when our turn is up, so we just watch
-    the page URL. Progress is logged every ~30 sec for observability,
-    including any queue metadata we can scrape off the page (status
-    timestamp, queue id) so we have a richer dataset to reason about.
+    redirect back to the target URL when our turn is up. Detection is
+    event-driven via `page.wait_for_url` — we react to the redirect the
+    moment it commits, instead of noticing it on the next tick of a poll
+    loop (the old 2 s poll wasted ~1 s average, worst-case 2 s, at the
+    single hottest moment of the run). Progress is still logged every
+    ~30 s for observability, including any queue metadata we can scrape
+    off the page (status timestamp, queue id) so we have a richer dataset
+    to reason about.
 
     We also attach a response listener to capture Queue-it's spa-api
     status poll bodies (numeric `progress`, `QueueState`, etc.) as they
@@ -121,7 +130,6 @@ async def wait_for_queue_release(
     """
     loop = asyncio.get_event_loop()
     start = loop.time()
-    last_log = start
     initial_meta = await _scrape_queue_metadata(page)
     last_meta = initial_meta
     log.warning(
@@ -168,56 +176,61 @@ async def wait_for_queue_release(
 
     page.on("response", _on_response)
     try:
-        while True:
-            if not is_in_queue(page):
-                wait_seconds = round(loop.time() - start, 1)
-                log.info(
-                    "virtual waiting room: released",
-                    wait_seconds=wait_seconds,
-                    url=page.url,
-                    samples_captured=len(samples),
-                )
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=15_000)
-                except Exception:
-                    pass
-
-                # Derive summary stats from captured samples.
-                phase2 = [s for s in samples if s["phase"] == 2]
-                phase2_start = phase2[0] if phase2 else None
-                phase2_end = phase2[-1] if phase2 else None
-                return {
-                    "wait_sec": wait_seconds,
-                    "queue_id": last_meta.get("queue_id") or initial_meta.get("queue_id"),
-                    "headline_at_release": last_meta.get("headline"),
-                    "headline_at_entry": initial_meta.get("headline"),
-                    "status_samples": samples,
-                    "phase2_start_utc": phase2_start["t_utc"] if phase2_start else None,
-                    "phase2_initial_progress": (
-                        phase2_start["progress"] if phase2_start else None
-                    ),
-                    "phase2_last_progress": (
-                        phase2_end["progress"] if phase2_end else None
-                    ),
-                    "phase2_sample_count": len(phase2),
-                    "phase1_sample_count": sum(1 for s in samples if s["phase"] == 1),
-                }
-
+        # Event-driven wait: wait_for_url resolves the instant the page
+        # navigates to a non-queue URL. We wake every log_interval_sec
+        # (via the timeout) purely to scrape + log progress metadata,
+        # then immediately re-arm the wait.
+        while is_in_queue(page):
             elapsed = loop.time() - start
             if elapsed >= timeout_sec:
                 raise RuntimeError(
                     f"virtual waiting room: timed out after {timeout_sec}s (still on {page.url})"
                 )
-            if loop.time() - last_log >= log_interval_sec:
+            try:
+                await page.wait_for_url(
+                    lambda url: QUEUE_HOST not in url,
+                    timeout=min(log_interval_sec, timeout_sec - elapsed) * 1000,
+                    wait_until="domcontentloaded",
+                )
+                break  # released — redirect committed and document parsed
+            except PlaywrightTimeoutError:
+                # Still queued; this tick exists only for observability.
                 last_meta = await _scrape_queue_metadata(page)
                 log.info(
                     "virtual waiting room: still waiting",
-                    wait_seconds=round(elapsed, 1),
+                    wait_seconds=round(loop.time() - start, 1),
                     url=page.url,
                     **last_meta,
                 )
-                last_log = loop.time()
-            await asyncio.sleep(poll_interval_sec)
+
+        wait_seconds = round(loop.time() - start, 1)
+        log.info(
+            "virtual waiting room: released",
+            wait_seconds=wait_seconds,
+            url=page.url,
+            samples_captured=len(samples),
+        )
+
+        # Derive summary stats from captured samples.
+        phase2 = [s for s in samples if s["phase"] == 2]
+        phase2_start = phase2[0] if phase2 else None
+        phase2_end = phase2[-1] if phase2 else None
+        return {
+            "wait_sec": wait_seconds,
+            "queue_id": last_meta.get("queue_id") or initial_meta.get("queue_id"),
+            "headline_at_release": last_meta.get("headline"),
+            "headline_at_entry": initial_meta.get("headline"),
+            "status_samples": samples,
+            "phase2_start_utc": phase2_start["t_utc"] if phase2_start else None,
+            "phase2_initial_progress": (
+                phase2_start["progress"] if phase2_start else None
+            ),
+            "phase2_last_progress": (
+                phase2_end["progress"] if phase2_end else None
+            ),
+            "phase2_sample_count": len(phase2),
+            "phase1_sample_count": sum(1 for s in samples if s["phase"] == 1),
+        }
     finally:
         try:
             page.remove_listener("response", _on_response)
