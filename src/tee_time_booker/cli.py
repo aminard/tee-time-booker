@@ -78,6 +78,36 @@ end tell'''
         click.echo(f"warning: could not open log-watcher tabs: {e}", err=True)
 
 
+def _load_plan_or_die(plan_path: Path):
+    """Load a plan file, converting validation failures into one clean,
+    human-readable error instead of a multi-screen Python traceback.
+
+    Plan files are hand-edited YAML, so mistakes (typo'd course slug,
+    inverted time range, malformed syntax) are expected user input — they
+    deserve a short answer naming the problem, not a stack dump.
+    """
+    import yaml
+    from pydantic import ValidationError
+
+    from tee_time_booker.config import load_plan
+
+    try:
+        return load_plan(plan_path)
+    except ValidationError as e:
+        n = e.error_count()
+        lines = [f"{plan_path} has {n} problem{'s' if n != 1 else ''}:", ""]
+        for err in e.errors():
+            loc = ".".join(str(p) for p in err["loc"])
+            msg = err["msg"]
+            # Pydantic prefixes custom validator messages; strip the noise.
+            if msg.startswith("Value error, "):
+                msg = msg[len("Value error, "):]
+            lines.append(f"  • {f'{loc}: ' if loc else ''}{msg}")
+        raise click.ClickException("\n".join(lines)) from e
+    except yaml.YAMLError as e:
+        raise click.ClickException(f"{plan_path} is not valid YAML:\n{e}") from e
+
+
 def _cleanup_spent_plists(*, dry_run: bool, verbose: bool) -> tuple[int, int]:
     """Scan ~/Library/LaunchAgents/ for spent tee-time-booker plists and
     unload + remove them. "Spent" = the plist's target booking-open moment
@@ -206,7 +236,6 @@ def schedule(
     from datetime import timedelta
 
     from tee_time_booker.clock import compute_booking_opens_at
-    from tee_time_booker.config import load_plan
     from tee_time_booker.constants import CENTRAL
 
     # Sweep any spent plists before adding a new one, so ~/Library/LaunchAgents/
@@ -226,7 +255,7 @@ def schedule(
             f"({login_lead_seconds}) plus startup buffer."
         )
 
-    plan = load_plan(plan_path)
+    plan = _load_plan_or_die(plan_path)
     opens_at_utc = compute_booking_opens_at(plan.target_date)
     fire_at_utc = opens_at_utc - timedelta(minutes=lead_minutes)
     fire_at_local = fire_at_utc.astimezone()
@@ -373,8 +402,12 @@ def run(
     from dotenv import load_dotenv
 
     from tee_time_booker.book import BookingRunError, run_scheduled_booking
-    from tee_time_booker.config import Secrets, load_plan
+    from tee_time_booker.config import Secrets
     from tee_time_booker.constants import CENTRAL
+
+    # Validate the plan before any logging machinery spins up — a typo'd
+    # plan file should produce one clean error, not an empty run log.
+    plan = _load_plan_or_die(plan_path)
 
     logs_dir = Path("logs")
     logs_dir.mkdir(exist_ok=True)
@@ -397,7 +430,6 @@ def run(
 
         load_dotenv()
         secrets = Secrets()  # type: ignore[call-arg]
-        plan = load_plan(plan_path)
 
         click.echo(f"Logging structlog timeline to: {log_path}")
 
